@@ -284,7 +284,13 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
             provider.doc,
             serverStateVector
           );
-          applyServerUpdate(provider.doc, serverUpdate, divergent, provider);
+          applyServerUpdate(
+            provider.doc,
+            serverUpdate,
+            divergent,
+            provider,
+            serverStateVector
+          );
           if (emitSynced && !provider.synced) {
             provider.synced = true;
           }
@@ -600,7 +606,7 @@ export namespace WebSocketProvider {
  * under its own clientID, and the server has re-authored the equivalent
  * content under a new ID — so failing to clear would duplicate it.
  */
-function hasDivergentHistory(
+export function hasDivergentHistory(
   doc: Y.Doc,
   serverStateVector: Uint8Array
 ): boolean {
@@ -628,7 +634,7 @@ function hasDivergentHistory(
  * (the persisted file is the source of truth).
  *
  * Key-based content (`Y.Map` entries, `Y.XmlElement` attributes) is left
- * untouched — see `clearSharedType`. Deleting a key tombstones the client's
+ * untouched — see `deleteItemsUnknownToServer`. Deleting a key tombstones the client's
  * item for it, and Yjs reads a key as the *rightmost* item or `undefined` if
  * that item is deleted; it does not fall back to a live concurrent item. So if
  * the client's clientID outranks the server's, the cleared key reads as
@@ -641,35 +647,51 @@ function hasDivergentHistory(
  * attributed to the provider and not re-broadcast to the server as a separate
  * update message; in the divergent case the tombstones reach the server via
  * the SS2 reply instead.
+ *
+ * THE REPAIR IS IDEMPOTENT, and that is load-bearing. Only items the server
+ * does not know (their ID is not covered by `serverStateVector`) are deleted.
+ * An earlier version cleared the FULL ordered range, which is correct on the
+ * first pass but destructive on a second: if the first repair's SS2 reply is
+ * lost, the next handshake is divergent again, and a full clear then deletes
+ * the SERVER'S OWN ITEMS — applied at the server, that empties the document
+ * on disk (observed in production as notebooks truncated to one blank cell).
+ * Deleting only server-unknown items makes any number of repair passes safe:
+ * pass N+1 finds the server's items covered by its state vector and leaves
+ * them alone.
  */
-function applyServerUpdate(
+export function applyServerUpdate(
   doc: Y.Doc,
   serverUpdate: Uint8Array,
   divergent: boolean,
-  origin?: unknown
+  origin?: unknown,
+  serverStateVector?: Uint8Array
 ): void {
-  if (!divergent) {
+  if (!divergent || serverStateVector === undefined) {
     Y.applyUpdate(doc, serverUpdate, origin);
     return;
   }
 
+  const serverSV = Y.decodeStateVector(serverStateVector);
   doc.transact(() => {
     for (const [, type] of doc.share) {
-      clearSharedType(type);
+      deleteItemsUnknownToServer(type, serverSV);
     }
     Y.applyUpdate(doc, serverUpdate);
   }, origin);
 }
 
 /**
- * Clears the ordered content of a top-level Yjs shared type so the server's
- * state (applied next) replaces it. Considers every Yjs shared type:
+ * Deletes the ordered content of a top-level Yjs shared type that the server
+ * does not already know, so the server's state (applied next) replaces the
+ * client-only content without duplicating — and without ever touching items
+ * the server owns, which is what makes the repair idempotent. Considers every
+ * Yjs shared type:
  *
- *  - Ordered types — content is cleared:
+ *  - Ordered types — server-unknown items are deleted:
  *      - `Y.Array`, `Y.Text` (and `Y.XmlText`, which extends it): delete the
- *        full index range.
+ *        index ranges of items not covered by the server's state vector.
  *      - `Y.XmlElement` / `Y.XmlFragment` (`Y.XmlElement` extends
- *        `Y.XmlFragment`): delete all child nodes.
+ *        `Y.XmlFragment`): likewise, over child nodes.
  *  - Key-based content — intentionally left intact:
  *      - `Y.Map` entries (and `Y.XmlHook`, which extends `Y.Map`), and
  *        `Y.XmlElement` attributes.
@@ -679,22 +701,56 @@ function applyServerUpdate(
  *    it lets the server's value resolve via last-writer-wins (never absent).
  *    Key-based types don't duplicate, so they never needed clearing anyway.
  */
-function clearSharedType(type: Y.AbstractType<any>): void {
+export function deleteItemsUnknownToServer(
+  type: Y.AbstractType<any>,
+  serverSV: Map<number, number>
+): void {
   // Key-based: skip (clearing can drop the key entirely — see above).
   if (type instanceof Y.Map) {
     return;
   }
 
-  // Ordered: clear the full sequence. `Y.Text` also covers `Y.XmlText`.
-  if (type instanceof Y.Array || type instanceof Y.Text) {
-    type.delete(0, type.length);
+  // Ordered types only. `Y.Text` also covers `Y.XmlText`; `Y.XmlElement`
+  // extends `Y.XmlFragment`. Attributes on XML elements are key-based and
+  // left intact for the reason above.
+  const ordered =
+    type instanceof Y.Array ||
+    type instanceof Y.Text ||
+    type instanceof Y.XmlFragment;
+  if (!ordered) {
     return;
   }
 
-  // `Y.XmlElement` extends `Y.XmlFragment`. Clear child nodes only; element
-  // attributes are key-based and left intact for the reason above.
-  if (type instanceof Y.XmlFragment) {
-    type.delete(0, type.length);
-    return;
+  // Walk the item chain, collecting [index, length] ranges whose IDs the
+  // server's state vector does NOT cover. An item spans clocks
+  // [id.clock, id.clock + length); the server knows the prefix up to
+  // serverSV.get(id.client). A partially-covered item contributes only its
+  // uncovered suffix; `type.delete` splits items as needed.
+  //
+  // Index bookkeeping matches `type.delete` semantics: only non-deleted,
+  // countable items occupy indices (formatting marks in Y.Text are not
+  // countable and are skipped, exactly as the previous full-range clear
+  // left them in place).
+  const ranges: Array<[number, number]> = [];
+  let index = 0;
+  let item: any = (type as any)._start;
+  while (item !== null) {
+    if (!item.deleted && item.countable) {
+      const known = serverSV.get(item.id.client) ?? 0;
+      const coveredLen = Math.max(
+        0,
+        Math.min(item.length, known - item.id.clock)
+      );
+      if (coveredLen < item.length) {
+        ranges.push([index + coveredLen, item.length - coveredLen]);
+      }
+      index += item.length;
+    }
+    item = item.right;
+  }
+
+  // Delete back-to-front so earlier indices stay valid.
+  for (let i = ranges.length - 1; i >= 0; i--) {
+    type.delete(ranges[i][0], ranges[i][1]);
   }
 }
