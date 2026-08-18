@@ -20,6 +20,7 @@ import * as Y from 'yjs';
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
 import { WebsocketProvider as YWebsocketProvider } from 'y-websocket';
+import { bumpConnectionEpoch, shouldBumpEpoch } from './executionChain';
 import { requestAPI } from './requests';
 import { JupyterFrontEnd } from '@jupyterlab/application';
 import { DocumentWidget } from '@jupyterlab/docregistry';
@@ -365,6 +366,17 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
    */
   private _onStatus = ({ status }: { status: string }): void => {
     if (status === 'connected') {
+      // Invalidate the execution-request chain when the room's
+      // enqueued-request history may not have survived (room GC +
+      // recreation), so no request chains onto a predecessor the new room
+      // will never see. Gated on downtime: after a short blip the room is
+      // guaranteed alive, and there the chain must be preserved — it is the
+      // FIFO protection for a request in flight across the blip.
+      const roomName = this._yWebsocketProvider?.roomname;
+      if (roomName && shouldBumpEpoch(this._disconnectedAt, Date.now())) {
+        bumpConnectionEpoch(roomName);
+      }
+      this._disconnectedAt = null;
       if (WebSocketProvider._reconnectedManually) {
         console.info('WebSocket reconnected successfully.');
         WebSocketProvider._reconnectedManually = false;
@@ -377,6 +389,12 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
     }
 
     // status === 'disconnected'
+    // Keep the FIRST disconnect time: y-websocket emits 'disconnected' on
+    // every failed retry, and downtime is measured from when the connection
+    // was last actually up.
+    if (this._disconnectedAt === null) {
+      this._disconnectedAt = Date.now();
+    }
     this._reconnectAttempts++;
 
     if (this._reconnectAttempts > WebSocketProvider.MAX_RECONNECT_ATTEMPTS) {
@@ -523,6 +541,7 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
   private _trans: TranslationBundle;
   private _fileId: string | null = null;
   private _reconnectAttempts = 0;
+  private _disconnectedAt: number | null = null;
 
   /**
    * Reference to the global retry dialog.

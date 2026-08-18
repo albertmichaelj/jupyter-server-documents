@@ -11,6 +11,10 @@ import {
   waitForDialog
 } from '@jupyterlab/testutils';
 import { requestAPI } from '../docprovider/requests';
+import {
+  getConnectionEpoch,
+  EPOCH_BUMP_MIN_DOWNTIME_MS
+} from '../docprovider/executionChain';
 import { WebSocketProvider } from '../docprovider/yprovider';
 
 jest.mock('../docprovider/requests', () => ({
@@ -256,6 +260,44 @@ describe('WebSocketProvider reconnection', () => {
       expect(console.info).toHaveBeenCalledWith(
         'WebSocket reconnected successfully.'
       );
+      provider.dispose();
+    });
+  });
+
+  describe('_onStatus execution-chain epoch', () => {
+    it('bumps the epoch only when downtime could have outlived the room', async () => {
+      const provider = createProvider();
+      const wsProvider = await waitForProviderConnect(provider);
+      // roomName is `${format}:${contentType}:${fileId}` from _connect.
+      const room = 'json:notebook:test-file-id';
+
+      const nowSpy = jest.spyOn(Date, 'now');
+      try {
+        nowSpy.mockReturnValue(100_000);
+        wsProvider.emit('status', { status: 'connected' });
+        const base = getConnectionEpoch(room);
+
+        // Short blip: the room is guaranteed alive, and the chain is the
+        // FIFO protection for a request in flight across the blip — it must
+        // survive.
+        wsProvider.emit('status', { status: 'disconnected' });
+        nowSpy.mockReturnValue(102_000);
+        wsProvider.emit('status', { status: 'connected' });
+        expect(getConnectionEpoch(room)).toBe(base);
+
+        // Walk-away: downtime is measured from the FIRST disconnect even
+        // when retry cycles emit further 'disconnected' events, and past
+        // the gate the chain must break.
+        nowSpy.mockReturnValue(102_000);
+        wsProvider.emit('status', { status: 'disconnected' });
+        nowSpy.mockReturnValue(102_000 + EPOCH_BUMP_MIN_DOWNTIME_MS - 1_000);
+        wsProvider.emit('status', { status: 'disconnected' });
+        nowSpy.mockReturnValue(102_000 + EPOCH_BUMP_MIN_DOWNTIME_MS);
+        wsProvider.emit('status', { status: 'connected' });
+        expect(getConnectionEpoch(room)).toBe(base + 1);
+      } finally {
+        nowSpy.mockRestore();
+      }
       provider.dispose();
     });
   });

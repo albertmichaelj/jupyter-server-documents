@@ -8,6 +8,10 @@ import { PageConfig, URLExt } from '@jupyterlab/coreutils';
 import { ServerConnection } from '@jupyterlab/services';
 import { Notification } from '@jupyterlab/apputils';
 import { jsdDocumentProviderFactory } from './docprovider';
+import {
+  ExecutionChain,
+  getConnectionEpoch
+} from './docprovider/executionChain';
 import { disableSavePlugin } from './disablesave';
 import { outputsServicePlugin } from './outputs';
 import { murmur2 } from './murmur2';
@@ -73,7 +77,9 @@ export const serverCellExecutorPlugin: JupyterFrontEndPlugin<INotebookCellExecut
       const serverSettings = app.serviceManager.serverSettings;
       // Track the last request_id per document so successive runCell calls
       // can chain previous_request_id without touching any notebook internals.
-      const lastRequestIdByDoc = new Map<string, string>();
+      // Keyed by connection epoch: a chain must not span a reconnect, because
+      // the room's enqueued-request history may not have survived it.
+      const executionChain = new ExecutionChain();
       return {
         async runCell({
           cell,
@@ -145,8 +151,11 @@ export const serverCellExecutorPlugin: JupyterFrontEndPlugin<INotebookCellExecut
           // cells simultaneously don't block each other.
           const docKey = `${documentId ?? path}:${clientId}`;
           const requestId = crypto.randomUUID();
-          const previousRequestId = lastRequestIdByDoc.get(docKey);
-          lastRequestIdByDoc.set(docKey, requestId);
+          const previousRequestId = executionChain.next(
+            docKey,
+            getConnectionEpoch(documentId ?? path),
+            requestId
+          );
 
           if (!documentId) {
             // document_id not yet in shared model state — fall back to path.
@@ -177,7 +186,7 @@ export const serverCellExecutorPlugin: JupyterFrontEndPlugin<INotebookCellExecut
               // pressed Run. Show a visible warning so the user knows to re-run.
               // Clear the ordering chain: this request was never enqueued on the
               // server so the next run must not reference it as a predecessor.
-              lastRequestIdByDoc.delete(docKey);
+              executionChain.clear(docKey, requestId);
               Notification.warning(
                 'Cell not executed: the cell source changed while the request was in flight. Please re-run the cell.',
                 { autoClose: 5000 }
@@ -188,11 +197,14 @@ export const serverCellExecutorPlugin: JupyterFrontEndPlugin<INotebookCellExecut
             if (!response.ok) {
               // Any other failure (408, 500, etc.) also breaks the chain —
               // the request was never successfully enqueued.
-              lastRequestIdByDoc.delete(docKey);
+              executionChain.clear(docKey, requestId);
             }
             onCellExecuted({ cell, success: response.ok });
             return response.ok;
           } catch (error) {
+            // Unknown outcome (network error) — the request may never have
+            // been enqueued, so the next run must not chain onto it.
+            executionChain.clear(docKey, requestId);
             onCellExecuted({ cell, success: false });
             if (!cell.isDisposed) {
               throw error;
