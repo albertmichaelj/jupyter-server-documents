@@ -39,7 +39,13 @@ jobs:
           import glob, json, sys, zipfile
           whl = glob.glob("dist/*.whl")[0]
           z = zipfile.ZipFile(whl)
-          pkg = [n for n in z.namelist() if n.endswith("labextension/package.json")][0]
+          cands = [n for n in z.namelist()
+                   if "/labextensions/" in n and n.endswith("/package.json")
+                   and "static" not in n]
+          if not cands:
+              sys.exit("FAILED: no labextension package.json in the wheel -- "
+                       "the prebuilt frontend is missing entirely")
+          pkg = sorted(cands, key=len)[0]
           meta = json.loads(z.read(pkg))
           entry = meta["jupyterlab"]["_build"]["load"]
           bundle = z.read(pkg.rsplit("package.json", 1)[0] + entry).decode("utf-8", "replace")

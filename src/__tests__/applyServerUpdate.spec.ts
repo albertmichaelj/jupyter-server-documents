@@ -77,7 +77,10 @@ describe('applyServerUpdate divergent repair', () => {
     const serverSV = Y.encodeStateVector(server); // covers 'synced.' only
     client.getText('source').insert(7, ' offline-tail');
 
-    const serverUpdate = Y.encodeStateAsUpdate(server, Y.encodeStateVector(client));
+    const serverUpdate = Y.encodeStateAsUpdate(
+      server,
+      Y.encodeStateVector(client)
+    );
     applyServerUpdate(client, serverUpdate, true, undefined, serverSV);
 
     // The covered prefix survives; the uncovered offline tail is sacrificed
@@ -92,7 +95,10 @@ describe('applyServerUpdate divergent repair', () => {
     Y.applyUpdate(server, Y.encodeStateAsUpdate(client));
     client.getText('source').insert(4, ' + local edit');
 
-    const serverUpdate = Y.encodeStateAsUpdate(server, Y.encodeStateVector(client));
+    const serverUpdate = Y.encodeStateAsUpdate(
+      server,
+      Y.encodeStateVector(client)
+    );
     applyServerUpdate(client, serverUpdate, false, undefined);
 
     expect(client.getText('source').toString()).toBe('base + local edit');
