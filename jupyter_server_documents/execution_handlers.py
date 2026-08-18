@@ -1,3 +1,5 @@
+import asyncio
+
 from jupyter_server.auth.decorator import authorized
 from jupyter_server.base.handlers import APIHandler
 from tornado import web
@@ -77,6 +79,34 @@ class KernelExecuteHandler(ExecutionsAPIHandler):
             raise web.HTTPError(400, f"No YRoom available for document: {document_id!r}")
         if not isinstance(yroom, YNotebookRoom):
             raise web.HTTPError(400, f"Room {document_id!r} is not a notebook room")
+
+        if not yroom.has_kernel_connection:
+            # A room that was garbage-collected and later re-created has a live
+            # session but no kernel wiring: the room→kernel bond is only formed
+            # in `create_session`, and the old room's stop callback tore it
+            # down. Without this, every execution against the re-created room
+            # fails ("YNotebookRoom is not connected to a kernel") until the
+            # user shuts the kernel down and starts a fresh session. The
+            # request names the kernel in the URL, so re-wire here exactly the
+            # way `create_session` does.
+            try:
+                kernel_manager = self.kernel_manager.get_kernel(kernel_id)
+            except (KeyError, web.HTTPError):
+                # MappingKernelManager raises HTTPError(404) itself for an
+                # unknown kernel; older managers raise KeyError.
+                # 400 (not 404) to preserve the endpoint's existing contract:
+                # before the lazy re-wire, this request shape fell through to
+                # execute_cells' RuntimeError and returned 400.
+                raise web.HTTPError(400, f"Kernel not found: {kernel_id}")
+            await yroom.connect_kernel(kernel_manager)
+            yroom.add_stop_callback(
+                lambda: asyncio.create_task(yroom.disconnect_kernel())
+            )
+            self.log.info(
+                "Reconnected room %r to kernel %s for execution.",
+                document_id,
+                kernel_id,
+            )
 
         try:
             await yroom.execute_cells(

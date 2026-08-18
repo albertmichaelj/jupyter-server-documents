@@ -112,6 +112,17 @@ class YNotebookRoom(YRoom):
 
     # ── Kernel client lifecycle ───────────────────────────────────────────────────
 
+    @property
+    def has_kernel_connection(self) -> bool:
+        """Whether this room currently has a live kernel client attached.
+
+        False for a room that was garbage-collected and later re-created:
+        the room→kernel bond is only formed in ``create_session`` and the
+        old room's stop callback tore it down, so the new room starts
+        unwired even though its session and kernel are still alive.
+        """
+        return self._kernel_client is not None
+
     async def connect_kernel(self, kernel_manager) -> None:
         """Attach this room to a running kernel.
 

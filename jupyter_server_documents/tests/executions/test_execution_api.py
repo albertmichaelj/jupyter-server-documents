@@ -164,3 +164,67 @@ async def test_full_execution_via_jupyverse_endpoint(jp_fetch, jp_serverapp, tmp
 
     # Cleanup
     await jp_fetch("api", "sessions", session_id, method="DELETE")
+
+
+@pytest.mark.timeout(TEST_TIMEOUT)
+async def test_execute_rewires_a_recreated_room(jp_fetch, jp_serverapp, tmp_path):
+    """A room freed by GC and re-created must be re-wired to its session's
+    still-running kernel by the execute endpoint — not fail 400 forever.
+
+    The room→kernel bond is only formed in `create_session`, and the old
+    room's stop callback tears it down when the room is freed. Before the
+    lazy re-wire, the re-created room had a live session and a live kernel
+    but no connection between them, and every execution returned 400
+    ("YNotebookRoom is not connected to a kernel") until the user shut the
+    kernel down and started a fresh session. Observed in production within
+    hours of sessions being able to survive reconnects.
+    """
+    nb_name = f"test_{uuid.uuid4().hex[:8]}.ipynb"
+    (tmp_path / nb_name).write_text(NOTEBOOK_CONTENT)
+
+    r = await jp_fetch(
+        "api", "sessions",
+        method="POST",
+        body=json.dumps({
+            "path": nb_name,
+            "name": nb_name,
+            "type": "notebook",
+            "kernel": {"name": "python3"},
+        }),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.code == 201
+    session = json.loads(r.body)
+    session_id = session["id"]
+    kernel_id = session["kernel"]["id"]
+
+    yroom = await _wait_for_yroom(jp_serverapp, session_id, CELL_ID)
+    document_id = yroom.room_id
+    assert yroom.has_kernel_connection
+
+    # Simulate the GC cycle: free the room while session + kernel live on,
+    # then re-create it the way a client reconnect does.
+    manager = jp_serverapp.web_app.settings["yroom_manager"]
+    assert await manager.delete_room(document_id)
+    yroom2 = manager.get_room(document_id)
+    assert yroom2 is not yroom
+    await yroom2.file_api.until_content_loaded
+    assert not yroom2.has_kernel_connection
+
+    # Execution against the re-created room must succeed (this returned 400
+    # before the lazy re-wire) ...
+    r = await jp_fetch(
+        "api", "kernels", kernel_id, "execute",
+        method="POST",
+        body=json.dumps({
+            "document_id": document_id,
+            "cells": [{"cell_id": CELL_ID, "source_hash": CELL_SOURCE_HASH}],
+        }),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.code == 200
+
+    # ... and the room must now be wired.
+    assert yroom2.has_kernel_connection
+
+    await jp_fetch("api", "sessions", session_id, method="DELETE")
