@@ -192,6 +192,103 @@ class TestSyncTimeout:
         assert yroom.update_channel._paused is False
 
 
+class TestLateSS2:
+    """Regression tests for the blank-notebook data loss.
+
+    A SyncStep2 reply arriving after `handshake_timeout` must be applied, and
+    the client must not be disconnected. Dropping the late reply leaves the
+    server ignorant of the client's IDs, so the client's next handshake is
+    divergent again and the client-side repair then deletes the server's own
+    content and syncs that deletion. See the `handle_sync` docstring.
+    """
+
+    @pytest.mark.asyncio
+    async def test_late_ss2_is_applied(self, make_yroom: MakeYRoom):
+        """An SS2 reply that misses the timeout is applied on arrival, and
+        the client stays connected."""
+        yroom = await make_yroom(handshake_timeout=0.3)
+        jupyter_ydoc = await yroom.get_jupyter_ydoc()
+        jupyter_ydoc.source = "hello "
+
+        # Client with a local edit the server has never seen.
+        ws = FakeWebSocket()
+        ws.doc["source"] += "world"
+        client_id = yroom.clients.add(ws)
+
+        yroom.add_message(client_id, ws.build_ss1())
+
+        # Let the handshake time out before the client replies. The unpaused
+        # update channel proves the handshake window has genuinely closed, so
+        # the reply below really does take the late path (guards against the
+        # timeout kwarg being silently ignored, which would make this test
+        # pass trivially via the in-time fast path).
+        await asyncio.sleep(0.6)
+        assert yroom.update_channel._paused is False
+
+        # Client processes the server's SS2 + SS1 and replies -- late.
+        ss2_reply = ws.process_server_messages()
+        assert ss2_reply is not None
+        yroom.add_message(client_id, ss2_reply)
+        await asyncio.sleep(0.2)
+
+        # The late reply must reach the server's YDoc...
+        assert "world" in str(jupyter_ydoc.source)
+        # ...and the client must still be connected.
+        assert ws.closed is False
+        assert yroom.clients.get(client_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_timeout_does_not_disconnect(self, make_yroom: MakeYRoom):
+        """Timeout ends the broadcast pause; it must not cut the client."""
+        yroom = await make_yroom(handshake_timeout=0.3)
+        ws = FakeWebSocket()
+        client_id = yroom.clients.add(ws)
+
+        yroom.add_message(client_id, ws.build_ss1())
+        await asyncio.sleep(0.6)
+
+        assert ws.closed is False
+        assert yroom.clients.get(client_id) is not None
+        assert yroom.update_channel._paused is False
+
+    @pytest.mark.asyncio
+    async def test_stale_ss2_during_another_clients_handshake(
+        self, make_yroom: MakeYRoom
+    ):
+        """A late SS2 from client A arriving while client B's handshake is
+        pending must still be applied, not dropped, and neither client may be
+        disconnected."""
+        yroom = await make_yroom(handshake_timeout=0.3)
+        jupyter_ydoc = await yroom.get_jupyter_ydoc()
+        jupyter_ydoc.source = "base "
+
+        # A's handshake times out before A replies.
+        ws_a = FakeWebSocket()
+        ws_a.doc["source"] += "from-a"
+        cid_a = yroom.clients.add(ws_a)
+        yroom.add_message(cid_a, ws_a.build_ss1())
+        await asyncio.sleep(0.6)
+        ss2_a = ws_a.process_server_messages()
+        assert ss2_a is not None
+
+        # B starts a handshake; while it is pending, A's late reply arrives.
+        ws_b = FakeWebSocket()
+        cid_b = yroom.clients.add(ws_b)
+        yroom.add_message(cid_b, ws_b.build_ss1())
+        await asyncio.sleep(0.05)
+        yroom.add_message(cid_a, ss2_a)
+
+        # Complete B's handshake in time.
+        ss2_b = ws_b.process_server_messages()
+        assert ss2_b is not None
+        yroom.add_message(cid_b, ss2_b)
+        await asyncio.sleep(0.3)
+
+        assert "from-a" in str(jupyter_ydoc.source)
+        assert ws_a.closed is False
+        assert ws_b.closed is False
+
+
 async def _complete_handshake(yroom: YRoom, ws: FakeWebSocket) -> str:
     """Helper: add a FakeWebSocket client and complete the full sync handshake.
     Returns the client_id."""
