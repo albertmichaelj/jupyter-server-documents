@@ -118,3 +118,65 @@ describe('applyServerUpdate divergent repair', () => {
     expect(client.getMap('meta').get('kernelspec')).toBe('python3');
   });
 });
+
+describe('hasDivergentHistory clock comparison', () => {
+  it('flags a non-self clientID whose clock exceeds server coverage', () => {
+    // Two tabs hold unequal amounts of a dead session's history. The
+    // less-complete tab repairs first and teaches the recreated room a
+    // PREFIX of the stale clientID. When the fuller tab then reconnects,
+    // presence-only detection sees every clientID covered and skips the
+    // repair — its stale tail syncs as live items next to the server's
+    // re-authored copy: permanent duplication on disk.
+    const staleSession = new Y.Doc();
+    staleSession.getText('source').insert(0, 'one|');
+    const prefix = Y.encodeStateAsUpdate(staleSession);
+    staleSession.getText('source').insert(4, 'two|');
+    const full = Y.encodeStateAsUpdate(staleSession);
+
+    const fullerTab = new Y.Doc();
+    Y.applyUpdate(fullerTab, full);
+
+    const serverDoc = new Y.Doc();
+    serverDoc.getText('source').insert(0, 'one|two|'); // re-authored from disk
+    Y.applyUpdate(serverDoc, prefix); // learned via the first repairer
+    const serverSV = Y.encodeStateVector(serverDoc);
+
+    expect(hasDivergentHistory(fullerTab, serverSV)).toBe(true);
+  });
+
+  it("does not flag the doc's own offline-edit overhang", () => {
+    const client = new Y.Doc();
+    client.getText('source').insert(0, 'synced.');
+    const server = new Y.Doc();
+    Y.applyUpdate(server, Y.encodeStateAsUpdate(client));
+    const serverSV = Y.encodeStateVector(server);
+
+    client.getText('source').insert(7, ' offline'); // legitimate offline work
+    expect(hasDivergentHistory(client, serverSV)).toBe(false);
+  });
+});
+
+describe('repair spares post-repair own insertions', () => {
+  it('a second pass must not delete content created after the first', () => {
+    const TEXT = 'the quick brown fox';
+    const server = makeServerDoc(TEXT);
+    const client = makeDivergentClientDoc(TEXT);
+    const serverUpdate = Y.encodeStateAsUpdate(server);
+    const serverSV = Y.encodeStateVector(server);
+
+    // Pass 1 repairs; its SS2 reply is then lost in transit.
+    applyServerUpdate(client, serverUpdate, true, undefined, serverSV);
+    expect(client.getText('source').toString()).toBe(TEXT);
+
+    // The user keeps working — this content postdates the dead room and
+    // cannot duplicate anything the server re-authored.
+    client.getText('source').insert(TEXT.length, ' NEW-WORK');
+
+    // Pass 2 runs against the same server state (still divergent: the
+    // server never learned this client's IDs).
+    expect(hasDivergentHistory(client, serverSV)).toBe(true);
+    applyServerUpdate(client, serverUpdate, true, undefined, serverSV);
+
+    expect(client.getText('source').toString()).toBe(TEXT + ' NEW-WORK');
+  });
+});

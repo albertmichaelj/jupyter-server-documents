@@ -27,34 +27,52 @@
 const connectionEpochs = new Map<string, number>();
 
 /**
- * Minimum WebSocket downtime before a reconnect invalidates chains.
+ * Minimum time since the client was last KNOWN ALIVE before a reconnect
+ * invalidates chains.
  *
- * A room is only freed after `YRoom.inactivity_timeout` (default 60s) with no
- * connected clients, and its inactivity clock cannot start before this client
- * disconnected — so a reconnect after less downtime than that is guaranteed
- * to find the room, and its request history, alive. Breaking the chain on
- * such a blip would give up FIFO protection for a request in flight across
- * it, for no benefit. 45s leaves margin for client-side measurement error.
+ * Downtime is measured from a liveness stamp refreshed every
+ * `ALIVE_STAMP_INTERVAL_MS` while connected — NOT from the 'disconnected'
+ * event. That distinction is the whole point: JS is frozen during laptop
+ * sleep (and Chrome tab-freeze), so the disconnect for a connection that
+ * died hours ago is only *delivered* at wake, seconds before the reconnect —
+ * measured that way, a 20-minute lid close looks like a 3-second blip. The
+ * interval stamp freezes with the page instead, so at wake the gap it shows
+ * IS the sleep.
  *
- * A server restart inside the window still loses the history; that costs one
- * recoverable 408 (the chain clears on failure), same as before this module
- * existed.
+ * Why gate at all: a room is only freed after `YRoom.inactivity_timeout`
+ * (default 60s) plus a sweep, so a short awake blip almost always finds the
+ * room, and its request history, alive — and there the chain must survive,
+ * because it is the FIFO protection for a request in flight across the blip.
+ * 45s leaves margin under the 60s bound for stamp granularity.
+ *
+ * Best-effort, not airtight: a client that is connected but idle can sit in
+ * a room that is already inactive (room activity is edit-based, not
+ * presence-based), so a sub-45s blip that straddles a sweep tick can still
+ * find the room freed; a server restart inside the window loses the history
+ * too. Either costs one recoverable 408 — the chain clears on failure — the
+ * same self-heal that existed before this module.
  */
 export const EPOCH_BUMP_MIN_DOWNTIME_MS = 45_000;
 
 /**
+ * How often the provider refreshes its liveness stamp while connected. Must
+ * be well under `EPOCH_BUMP_MIN_DOWNTIME_MS`: an awake blip measures at most
+ * its real length plus one interval.
+ */
+export const ALIVE_STAMP_INTERVAL_MS = 10_000;
+
+/**
  * Whether a transition to 'connected' should invalidate chains: yes on the
- * first connection or when downtime cannot be measured (both conservative —
+ * first connection or when liveness was never stamped (both conservative —
  * there is nothing in flight to protect on a first connection), and on any
- * reconnect after downtime long enough that the room may have been freed.
+ * reconnect after long enough that the room may have been freed.
  */
 export function shouldBumpEpoch(
-  disconnectedAt: number | null,
+  lastAliveAt: number | null,
   now: number
 ): boolean {
   return (
-    disconnectedAt === null ||
-    now - disconnectedAt >= EPOCH_BUMP_MIN_DOWNTIME_MS
+    lastAliveAt === null || now - lastAliveAt >= EPOCH_BUMP_MIN_DOWNTIME_MS
   );
 }
 

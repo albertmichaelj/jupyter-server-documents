@@ -20,7 +20,11 @@ import * as Y from 'yjs';
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
 import { WebsocketProvider as YWebsocketProvider } from 'y-websocket';
-import { bumpConnectionEpoch, shouldBumpEpoch } from './executionChain';
+import {
+  ALIVE_STAMP_INTERVAL_MS,
+  bumpConnectionEpoch,
+  shouldBumpEpoch
+} from './executionChain';
 import { requestAPI } from './requests';
 import { JupyterFrontEnd } from '@jupyterlab/application';
 import { DocumentWidget } from '@jupyterlab/docregistry';
@@ -317,7 +321,15 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
   get wsProvider() {
     return this._yWebsocketProvider;
   }
+  private _clearAliveInterval(): void {
+    if (this._aliveIntervalId !== null) {
+      window.clearInterval(this._aliveIntervalId);
+      this._aliveIntervalId = null;
+    }
+  }
+
   private _disconnect(): void {
+    this._clearAliveInterval();
     this._yWebsocketProvider?.off('connection-close', this._onConnectionClosed);
     this._yWebsocketProvider?.off('sync', this._onSync);
     this._yWebsocketProvider?.off('status', this._onStatus);
@@ -369,14 +381,22 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
       // Invalidate the execution-request chain when the room's
       // enqueued-request history may not have survived (room GC +
       // recreation), so no request chains onto a predecessor the new room
-      // will never see. Gated on downtime: after a short blip the room is
-      // guaranteed alive, and there the chain must be preserved — it is the
-      // FIFO protection for a request in flight across the blip.
+      // will never see. Gated on time since last KNOWN ALIVE — an
+      // interval-refreshed stamp, not the 'disconnected' event time, because
+      // during laptop sleep no JS runs and the disconnect is only delivered
+      // at wake, seconds before the reconnect. After a short awake blip the
+      // room is guaranteed alive, and there the chain must be preserved — it
+      // is the FIFO protection for a request in flight across the blip.
       const roomName = this._yWebsocketProvider?.roomname;
-      if (roomName && shouldBumpEpoch(this._disconnectedAt, Date.now())) {
+      if (roomName && shouldBumpEpoch(this._lastAliveAt, Date.now())) {
         bumpConnectionEpoch(roomName);
       }
-      this._disconnectedAt = null;
+      this._lastAliveAt = Date.now();
+      if (this._aliveIntervalId === null) {
+        this._aliveIntervalId = window.setInterval(() => {
+          this._lastAliveAt = Date.now();
+        }, ALIVE_STAMP_INTERVAL_MS);
+      }
       if (WebSocketProvider._reconnectedManually) {
         console.info('WebSocket reconnected successfully.');
         WebSocketProvider._reconnectedManually = false;
@@ -389,12 +409,9 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
     }
 
     // status === 'disconnected'
-    // Keep the FIRST disconnect time: y-websocket emits 'disconnected' on
-    // every failed retry, and downtime is measured from when the connection
-    // was last actually up.
-    if (this._disconnectedAt === null) {
-      this._disconnectedAt = Date.now();
-    }
+    // Stop refreshing the liveness stamp; it now marks when the connection
+    // was last known up, and downtime accumulates against it.
+    this._clearAliveInterval();
     this._reconnectAttempts++;
 
     if (this._reconnectAttempts > WebSocketProvider.MAX_RECONNECT_ATTEMPTS) {
@@ -541,7 +558,8 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
   private _trans: TranslationBundle;
   private _fileId: string | null = null;
   private _reconnectAttempts = 0;
-  private _disconnectedAt: number | null = null;
+  private _lastAliveAt: number | null = null;
+  private _aliveIntervalId: number | null = null;
 
   /**
    * Reference to the global retry dialog.
@@ -631,8 +649,22 @@ export function hasDivergentHistory(
 ): boolean {
   const clientSV = Y.decodeStateVector(Y.encodeStateVector(doc));
   const serverSV = Y.decodeStateVector(serverStateVector);
-  for (const clientId of clientSV.keys()) {
-    if (!serverSV.has(clientId)) {
+  for (const [clientId, clientClock] of clientSV) {
+    const serverClock = serverSV.get(clientId);
+    if (serverClock === undefined) {
+      return true;
+    }
+    // Presence is not enough: compare clocks for every clientID other than
+    // our own. If the server covers only a PREFIX of a stale clientID's
+    // history (an earlier-reconnecting tab repaired first and taught the
+    // recreated room part of the dead session's IDs), the uncovered tail
+    // would sync as live items alongside the server's re-authored copy of
+    // the same content — permanent duplication on disk. A live room can
+    // never lack history another client relayed through it, so a non-self
+    // clock overhang always means stale history. Our OWN overhang is the
+    // normal signature of legitimate offline edits and must not trigger
+    // the repair.
+    if (clientId !== doc.clientID && clientClock > serverClock) {
       return true;
     }
   }
@@ -691,13 +723,32 @@ export function applyServerUpdate(
   }
 
   const serverSV = Y.decodeStateVector(serverStateVector);
+  const spareOwnFrom = lastRepairEndClock.get(doc);
   doc.transact(() => {
     for (const [, type] of doc.share) {
-      deleteItemsUnknownToServer(type, serverSV);
+      deleteItemsUnknownToServer(type, serverSV, doc.clientID, spareOwnFrom);
     }
     Y.applyUpdate(doc, serverUpdate);
   }, origin);
+  // Record where our own history stands now that this repair committed.
+  // Items we create from here on postdate the dead room's content and can
+  // never duplicate the re-authored disk copy, so if THIS repair's SS2 reply
+  // is lost and another pass runs, that pass must spare them — otherwise a
+  // new cell typed between two handshakes is silently deleted everywhere.
+  lastRepairEndClock.set(
+    doc,
+    Y.decodeStateVector(Y.encodeStateVector(doc)).get(doc.clientID) ?? 0
+  );
 }
+
+/**
+ * Own clock recorded at the commit of each divergent repair, per doc. Items
+ * our client created at or beyond this clock postdate the room's death; a
+ * later repair pass must not delete them. (Deletions carry no clock, so the
+ * repair itself does not advance it — the boundary is exactly "everything I
+ * had when the repair ran".)
+ */
+const lastRepairEndClock = new WeakMap<Y.Doc, number>();
 
 /**
  * Deletes the ordered content of a top-level Yjs shared type that the server
@@ -722,7 +773,9 @@ export function applyServerUpdate(
  */
 export function deleteItemsUnknownToServer(
   type: Y.AbstractType<any>,
-  serverSV: Map<number, number>
+  serverSV: Map<number, number>,
+  ownClientID?: number,
+  spareOwnFromClock?: number
 ): void {
   // Key-based: skip (clearing can drop the key entirely — see above).
   if (type instanceof Y.Map) {
@@ -760,7 +813,17 @@ export function deleteItemsUnknownToServer(
         0,
         Math.min(item.length, known - item.id.clock)
       );
-      if (coveredLen < item.length) {
+      // Spare our own items created after the previous repair committed:
+      // they postdate the dead room's content, so they cannot duplicate the
+      // re-authored disk copy — deleting them would destroy legitimate work
+      // typed between two handshakes. (No item straddles the boundary: it
+      // is our own clock at the previous commit, and items existing then
+      // lie entirely below it.)
+      const spared =
+        spareOwnFromClock !== undefined &&
+        item.id.client === ownClientID &&
+        item.id.clock >= spareOwnFromClock;
+      if (!spared && coveredLen < item.length) {
         ranges.push([index + coveredLen, item.length - coveredLen]);
       }
       index += item.length;
