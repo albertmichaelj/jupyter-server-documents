@@ -327,7 +327,16 @@ class YRoomManager(LoggingConfigurable):
             if state not in {"idle", "dead", "unknown", None}
         }
         has_pending = bool(getattr(room, "has_pending_executions", False))
-        should_free = not busy_cells and not has_pending and room.inactive_and_empty
+        # Still honored if something reports it, though nothing currently
+        # writes this field (see the note above).
+        kernel_state = awareness.get("kernel", {}).get("execution_state", None)
+        kernel_busy = kernel_state not in {"idle", "dead", "unknown", None}
+        should_free = (
+            not busy_cells
+            and not has_pending
+            and not kernel_busy
+            and room.inactive_and_empty
+        )
         if self.show_gc_debug and room.empty and not should_free:
             reasons = []
             if not room.inactive:
@@ -336,6 +345,8 @@ class YRoomManager(LoggingConfigurable):
                 reasons.append(f"it has busy cells {busy_cells}")
             if has_pending:
                 reasons.append("it has queued or in-flight executions")
+            if kernel_busy:
+                reasons.append(f"it has execution state '{kernel_state}'")
             self.log.info(f"Not freeing notebook room '{room.room_id}' because {' and '.join(reasons)}.")
         return should_free
     
