@@ -356,12 +356,14 @@ class TestExecuteCell:
         room.get_jupyter_ydoc = AsyncMock(return_value=mock_ydoc)
 
         executed = asyncio.Event()
+        captured = {}
 
-        async def fake_execute(code, **kwargs):
+        async def fake_execute(code, output_hook=None):
+            captured["code"] = code
             executed.set()
             return {"status": "ok"}
 
-        room._kernel_client._async_execute_interactive = fake_execute
+        room._execute_interactive = fake_execute
         room._execution_queue = asyncio.Queue()
         room._execution_worker_task = asyncio.create_task(room._execution_worker())
 
@@ -371,39 +373,64 @@ class TestExecuteCell:
         room._execution_worker_task.cancel()
         await asyncio.gather(room._execution_worker_task, return_exceptions=True)
 
+        assert captured["code"] == "print('hello')"
+
     @pytest.mark.asyncio
     async def test_stdin_disabled(self):
-        """allow_stdin must be False — server-side execution cannot prompt the user."""
+        """allow_stdin must be False — server-side execution cannot prompt
+        the user. Enforced inside the vendored _execute_interactive when it
+        sends the execute_request, so asserted at the client.execute seam."""
+        import zmq
+        import zmq.asyncio
+
         room = make_yroom()
-        room._kernel_client = MagicMock()
-        room._kernel_manager = MagicMock()
-        room._shell_confirmed = True
-        room.output_processor = MagicMock()
+        ctx = zmq.asyncio.Context()
+        recv_sock = ctx.socket(zmq.PULL)
+        port = recv_sock.bind_to_random_port("tcp://127.0.0.1")
+        send_sock = ctx.socket(zmq.PUSH)
+        send_sock.connect(f"tcp://127.0.0.1:{port}")
 
-        mock_cell = {"id": "cell-1", "source": "x=1", "cell_type": "code", "outputs": []}
-        mock_ydoc = MagicMock()
-        mock_ydoc.ycells = [mock_cell]
-        room.get_jupyter_ydoc = AsyncMock(return_value=mock_ydoc)
+        captured = {}
+        script = [
+            {
+                "parent_header": {"msg_id": "m1"},
+                "header": {"msg_type": "status"},
+                "content": {"execution_state": "idle"},
+            },
+        ]
 
-        captured_kwargs = {}
-        executed = asyncio.Event()
+        class _Chan:
+            socket = recv_sock
 
-        async def fake_execute(code, **kwargs):
-            captured_kwargs.update(kwargs)
-            executed.set()
-            return {"status": "ok"}
+            def is_alive(self):
+                return True
 
-        room._kernel_client._async_execute_interactive = fake_execute
-        room._execution_queue = asyncio.Queue()
-        room._execution_worker_task = asyncio.create_task(room._execution_worker())
+            async def get_msg(self, timeout=0):
+                await recv_sock.recv()
+                return script.pop(0)
 
-        await room.execute_cell("cell-1", source_hash="2878563358")
-        await asyncio.wait_for(executed.wait(), timeout=2.0)
+        class _Client:
+            iopub_channel = _Chan()
 
-        room._execution_worker_task.cancel()
-        await asyncio.gather(room._execution_worker_task, return_exceptions=True)
+            def execute(self, code, allow_stdin=None):
+                captured["allow_stdin"] = allow_stdin
+                return "m1"
 
-        assert captured_kwargs.get("allow_stdin") is False
+            async def _async_recv_reply(self, mid, timeout=None):
+                return {"content": {"status": "ok"}}
+
+        room._kernel_client = _Client()
+        try:
+            await send_sock.send(b"x")
+            await asyncio.wait_for(
+                room._execute_interactive("x=1", lambda m: None), timeout=10
+            )
+        finally:
+            recv_sock.close(0)
+            send_sock.close(0)
+            ctx.term()
+
+        assert captured["allow_stdin"] is False
 
 
 # ── output_hook routing ───────────────────────────────────────────────────────
@@ -433,14 +460,14 @@ class TestOutputHook:
 
         executed = asyncio.Event()
 
-        async def fake_execute(code, output_hook=None, **kwargs):
+        async def fake_execute(code, output_hook=None):
             for msg in messages:
                 if output_hook:
                     output_hook(msg)
             executed.set()
             return {"status": "ok"}
 
-        room._kernel_client._async_execute_interactive = fake_execute
+        room._execute_interactive = fake_execute
         room._execution_queue = asyncio.Queue()
         room._execution_worker_task = asyncio.create_task(room._execution_worker())
 

@@ -13,6 +13,11 @@ from typing import TYPE_CHECKING, Any, Optional
 import asyncio
 import struct
 from dataclasses import dataclass
+from queue import Empty
+
+import zmq
+import zmq.asyncio
+from jupyter_core.utils import ensure_async
 
 from .yroom import YRoom
 
@@ -384,6 +389,64 @@ class YNotebookRoom(YRoom):
         except asyncio.CancelledError:
             pass
 
+    async def _execute_interactive(self, code: str, output_hook) -> dict:
+        """Send an execute_request and collect its output.
+
+        Adapted from jupyter_client 8.9.1 ``_async_execute_interactive``
+        (BSD), reduced to this room's call shape (output_hook set,
+        allow_stdin=False, no timeout, no stdin hook) with one behavioral
+        fix: the upstream output loop polls the raw iopub SOCKET and then
+        reads the iopub CHANNEL with ``get_msg(timeout=0)``. Under asyncio
+        the channel's own zero-timeout poll can miss the event the outer
+        poll reported, and the escaping ``queue.Empty`` killed an execution
+        whose request was ALREADY SENT — the kernel runs the cell, every
+        output is lost, and the cell shows idle with no result (reproduced
+        in fork CI's console-for-notebook test on a cold kernel). A spurious
+        wakeup must simply re-enter the poll loop.
+        """
+        client = self._kernel_client
+        assert client is not None
+        if not client.iopub_channel.is_alive():
+            raise RuntimeError("IOPub channel must be running to receive output")
+
+        msg_id = await ensure_async(client.execute(code, allow_stdin=False))
+
+        poller = zmq.asyncio.Poller()
+        iopub_socket = client.iopub_channel.socket
+        poller.register(iopub_socket, zmq.POLLIN)
+        try:
+            while True:
+                events = dict(await poller.poll(None))
+                if iopub_socket not in events:
+                    continue
+                try:
+                    msg = await ensure_async(
+                        client.iopub_channel.get_msg(timeout=0)
+                    )
+                except Empty:
+                    # Spurious wakeup: the socket-level poll fired but the
+                    # channel had nothing yet. Poll again — this is the one
+                    # divergence from upstream, where Empty escapes and
+                    # aborts the collection.
+                    continue
+
+                if msg["parent_header"].get("msg_id") != msg_id:
+                    # not from my request
+                    continue
+                output_hook(msg)
+
+                # stop on idle
+                if (
+                    msg["header"]["msg_type"] == "status"
+                    and msg["content"]["execution_state"] == "idle"
+                ):
+                    break
+        finally:
+            poller.unregister(iopub_socket)
+
+        # output is done, get the reply
+        return await client._async_recv_reply(msg_id, timeout=None)
+
     async def _run_item(self, item: _ExecutionItem) -> None:
         """Execute one queued cell using execute_interactive."""
         ycell = item.ycell
@@ -428,10 +491,9 @@ class YNotebookRoom(YRoom):
 
         try:
             assert self._kernel_client is not None
-            await self._kernel_client._async_execute_interactive(
+            await self._execute_interactive(
                 str(ycell.get("source", "")),
-                output_hook=output_hook,
-                allow_stdin=False,
+                output_hook,
             )
             # Write execution_count and state together so the frontend
             # sees them in the same YDoc transaction — avoids a brief

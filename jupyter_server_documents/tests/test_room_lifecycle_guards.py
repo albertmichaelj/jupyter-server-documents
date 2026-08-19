@@ -208,3 +208,84 @@ class TestShellConfirmedRetry:
             "execute_cells must re-attempt kernel-info when the shell was "
             "never confirmed; otherwise every execution is silently skipped"
         )
+
+
+class TestResilientExecuteInteractive:
+    @pytest.mark.asyncio
+    async def test_spurious_empty_reenters_poll_loop(self, make_yroom: MakeYRoom):
+        """The vendored execute loop must treat a spurious Empty from the
+        iopub channel as a wakeup to re-poll — upstream jupyter_client lets
+        it escape, killing an execution whose request was already sent (the
+        kernel runs the cell; every output is silently lost)."""
+        import zmq
+        import zmq.asyncio
+        from queue import Empty
+
+        room = await make_yroom(file_type="notebook")
+
+        ctx = zmq.asyncio.Context()
+        recv_sock = ctx.socket(zmq.PULL)
+        port = recv_sock.bind_to_random_port("tcp://127.0.0.1")
+        send_sock = ctx.socket(zmq.PUSH)
+        send_sock.connect(f"tcp://127.0.0.1:{port}")
+
+        msg_id = "req-1"
+
+        def iopub(msg_type, content):
+            return {
+                "parent_header": {"msg_id": msg_id},
+                "header": {"msg_type": msg_type},
+                "content": content,
+            }
+
+        script = [
+            "SPURIOUS-EMPTY",
+            iopub("status", {"execution_state": "busy"}),
+            iopub("execute_result", {"data": {"text/plain": "2"}}),
+            iopub("status", {"execution_state": "idle"}),
+        ]
+        empties = []
+
+        class _IopubChannel:
+            socket = recv_sock
+
+            def is_alive(self):
+                return True
+
+            async def get_msg(self, timeout=0):
+                await recv_sock.recv()  # consume one wakeup
+                entry = script.pop(0)
+                if entry == "SPURIOUS-EMPTY":
+                    empties.append(1)
+                    raise Empty
+                return entry
+
+        class _Client:
+            iopub_channel = _IopubChannel()
+
+            def execute(self, code, allow_stdin=False):
+                return msg_id
+
+            async def _async_recv_reply(self, mid, timeout=None):
+                return {"content": {"status": "ok"}}
+
+        room._kernel_client = _Client()
+        try:
+            # One wakeup per scripted get_msg call.
+            for _ in range(len(script)):
+                await send_sock.send(b"x")
+
+            outputs = []
+            reply = await asyncio.wait_for(
+                room._execute_interactive("1 + 1", outputs.append), timeout=10
+            )
+
+            assert empties, "the spurious-Empty branch was never exercised"
+            assert any(
+                m["header"]["msg_type"] == "execute_result" for m in outputs
+            ), "outputs after the spurious Empty were lost"
+            assert reply["content"]["status"] == "ok"
+        finally:
+            recv_sock.close(0)
+            send_sock.close(0)
+            ctx.term()

@@ -114,7 +114,19 @@ export const serverCellExecutorPlugin: JupyterFrontEndPlugin<INotebookCellExecut
             return true;
           }
 
-          const kernelId = sessionContext?.session?.kernel?.id;
+          let kernelId = sessionContext?.session?.kernel?.id;
+          if (!kernelId) {
+            // Right after kernel selection the session can still be
+            // settling: hasNoKernel is already false but session.kernel.id
+            // is briefly undefined, and the URL would contain the literal
+            // string "undefined". Wait for the context to settle once.
+            await sessionContext.ready;
+            kernelId = sessionContext?.session?.kernel?.id;
+            if (!kernelId) {
+              onCellExecuted({ cell, success: false });
+              return false;
+            }
+          }
           const apiURL = URLExt.join(
             serverSettings.baseUrl,
             `api/kernels/${kernelId}/execute`
