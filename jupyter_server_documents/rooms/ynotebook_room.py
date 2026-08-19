@@ -96,6 +96,10 @@ class YNotebookRoom(YRoom):
     so all connected clients see them via normal Yjs sync.
     """
 
+    # Class-level so tests can shrink them; instance code reads them via self.
+    _heartbeat_timeout: float = 30.0
+    _kernel_info_timeout: float = 30.0
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Kernel connection state — set by connect_kernel(), cleared by disconnect_kernel()
@@ -104,6 +108,7 @@ class YNotebookRoom(YRoom):
         self._shell_confirmed: bool = False
         self._execution_queue: asyncio.Queue | None = None
         self._execution_worker_task: asyncio.Task | None = None
+        self._worker_busy: bool = False
         self.output_processor: OutputProcessor | None = None
         # Per-request ordering: maps request_id → Event that is set once the
         # request has been enqueued.  Lets a successor wait for its predecessor
@@ -123,6 +128,19 @@ class YNotebookRoom(YRoom):
         """
         return self._kernel_client is not None
 
+    @property
+    def has_pending_executions(self) -> bool:
+        """Whether any execution is queued or in flight for this room.
+
+        Read by the room GC (`YRoomManager._should_free_room`) so a room is
+        never freed while server-side execution is running — freeing would
+        cancel the worker mid-execution and drop the outputs into a stopped
+        room after the enqueue already returned 200.
+        """
+        if self._worker_busy:
+            return True
+        return self._execution_queue is not None and not self._execution_queue.empty()
+
     async def connect_kernel(self, kernel_manager) -> None:
         """Attach this room to a running kernel.
 
@@ -140,7 +158,28 @@ class YNotebookRoom(YRoom):
         kernel_manager.add_restart_callback(self._on_kernel_restart, "restart")
         kernel_manager.add_restart_callback(self._on_kernel_dead, "dead")
 
-        await self._connect_client(kernel_manager)
+        try:
+            await self._connect_client(kernel_manager)
+        except Exception:
+            # Roll back the half-wired state. _connect_client assigns
+            # _kernel_client and starts channels BEFORE its heartbeat wait,
+            # and has_kernel_connection keys on _kernel_client — without this
+            # rollback, a failed connect (dead or wedged kernel) leaves every
+            # subsequent execute skipping the re-wire and failing with
+            # "execution worker is not running" until the kernel is replaced.
+            if self._kernel_client is not None:
+                try:
+                    self._kernel_client.stop_channels()
+                except Exception:
+                    self.log.exception("Error stopping channels during connect rollback:")
+                self._kernel_client = None
+            try:
+                kernel_manager.remove_restart_callback(self._on_kernel_restart, "restart")
+                kernel_manager.remove_restart_callback(self._on_kernel_dead, "dead")
+            except Exception:
+                self.log.exception("Error removing restart callbacks during connect rollback:")
+            self._kernel_manager = None
+            raise
 
         # Start queue + worker BEFORE fetching kernel_info so that execute_cell()
         # can enqueue items immediately.  Items wait in the worker until
@@ -248,7 +287,7 @@ class YNotebookRoom(YRoom):
         # The heartbeat channel starts paused; unpause it before polling.
         # Without this _async_is_alive() always returns False.
         self._kernel_client.hb_channel.unpause()
-        deadline = asyncio.get_event_loop().time() + 30.0
+        deadline = asyncio.get_event_loop().time() + self._heartbeat_timeout
         while not await self._kernel_client._async_is_alive():
             if asyncio.get_event_loop().time() > deadline:
                 raise RuntimeError(
@@ -275,7 +314,7 @@ class YNotebookRoom(YRoom):
         try:
             assert self._kernel_client is not None
             await asyncio.wait_for(
-                self._kernel_client._async_wait_for_ready(), timeout=30.0
+                self._kernel_client._async_wait_for_ready(), timeout=self._kernel_info_timeout
             )
         except Exception as e:
             self.log.warning("_fetch_kernel_info: failed: %s", e)
@@ -291,6 +330,7 @@ class YNotebookRoom(YRoom):
         try:
             while True:
                 item = await self._execution_queue.get()
+                self._worker_busy = True
                 try:
                     # Wait for kernel_info to be fetched (connect_kernel is async).
                     if not self._shell_confirmed:
@@ -316,6 +356,7 @@ class YNotebookRoom(YRoom):
                     item.ycell["execution_state"] = "idle"
                     self.log.error("Execution worker error for cell %s: %s", item.cell_id, e)
                 finally:
+                    self._worker_busy = False
                     self._execution_queue.task_done()
         except asyncio.CancelledError:
             pass
@@ -419,6 +460,17 @@ class YNotebookRoom(YRoom):
             raise RuntimeError("YNotebookRoom is not connected to a kernel")
         if self._execution_queue is None:
             raise RuntimeError("YNotebookRoom execution worker is not running")
+
+        if not self._shell_confirmed:
+            # The wire-up may have happened while the kernel was busy (the
+            # lazy re-wire runs at execute time, unlike create_session):
+            # _fetch_kernel_info's readiness wait then timed out and nothing
+            # retried it, so every execution was accepted and silently
+            # skipped by the worker — permanently, even after the kernel went
+            # idle. Re-attempt from request context, which matches
+            # connect_kernel's calling context (see _fetch_kernel_info's note
+            # on pyzmq + wait_for inside worker Tasks).
+            await self._fetch_kernel_info()
 
         # Wait for predecessor batch to finish enqueuing.
         if previous_request_id:

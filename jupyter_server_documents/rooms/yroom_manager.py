@@ -311,16 +311,31 @@ class YRoomManager(LoggingConfigurable):
                 self.log.info(f"Not freeing room '{room.room_id}' because it is not yet inactive.")
             return room.inactive_and_empty
 
+        # NOTE: an earlier version read local_state["kernel"]["execution_state"]
+        # here, but nothing writes that field (its writer was deleted along
+        # with the old kernels package), so it was always None and rooms were
+        # freeable MID-EXECUTION: the sweep cancelled the worker while a cell
+        # ran and the outputs vanished after the enqueue had returned 200.
+        # Guard on signals that are actually written: the room's own
+        # cell_execution_states awareness field, and the notebook room's
+        # execution queue/worker.
         awareness = room.get_awareness().get_local_state() or {}
-        execution_state = awareness.get("kernel", {}).get("execution_state", None)
-        can_free_execution_state = execution_state in { "idle", "dead", "unknown", None }
-        should_free = can_free_execution_state and room.inactive_and_empty
+        cell_states = awareness.get("cell_execution_states") or {}
+        busy_cells = {
+            cell_id: state
+            for cell_id, state in cell_states.items()
+            if state not in {"idle", "dead", "unknown", None}
+        }
+        has_pending = bool(getattr(room, "has_pending_executions", False))
+        should_free = not busy_cells and not has_pending and room.inactive_and_empty
         if self.show_gc_debug and room.empty and not should_free:
             reasons = []
             if not room.inactive:
                 reasons.append("it is not yet inactive")
-            if not can_free_execution_state:
-                reasons.append(f"it has execution state '{execution_state}'")
+            if busy_cells:
+                reasons.append(f"it has busy cells {busy_cells}")
+            if has_pending:
+                reasons.append("it has queued or in-flight executions")
             self.log.info(f"Not freeing notebook room '{room.room_id}' because {' and '.join(reasons)}.")
         return should_free
     

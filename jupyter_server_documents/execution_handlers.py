@@ -79,6 +79,13 @@ class KernelExecuteHandler(ExecutionsAPIHandler):
             raise web.HTTPError(400, f"No YRoom available for document: {document_id!r}")
         if not isinstance(yroom, YNotebookRoom):
             raise web.HTTPError(400, f"Room {document_id!r} is not a notebook room")
+        if yroom.stopped:
+            # delete_room stops the room and then awaits the final save before
+            # popping it from the manager, so get_room can return a stopped
+            # room in that window. Wiring or enqueueing into it would return
+            # 200 while the outputs land in an orphaned YDoc (never broadcast,
+            # never saved) and would leak a kernel client nothing can stop.
+            raise web.HTTPError(503, f"Room {document_id!r} is shutting down; retry")
 
         if not yroom.has_kernel_connection:
             # A room that was garbage-collected and later re-created has a live
@@ -98,7 +105,47 @@ class KernelExecuteHandler(ExecutionsAPIHandler):
                 # before the lazy re-wire, this request shape fell through to
                 # execute_cells' RuntimeError and returned 400.
                 raise web.HTTPError(400, f"Kernel not found: {kernel_id}")
-            await yroom.connect_kernel(kernel_manager)
+
+            # The URL kernel id is client-supplied; validate it against the
+            # document's session before forming a room-wide binding. On a
+            # shared server any collaborator could otherwise wire this
+            # document's room to any kernel they can name — and a stale tab
+            # could wire it to a replaced kernel — after which everyone's
+            # executions run in the wrong kernel with no error anywhere.
+            file_id = yroom.room_id.split(":", 2)[2]
+            fim = self.settings.get("file_id_manager")
+            doc_path = fim.get_path(file_id) if fim is not None else None
+            sessions = await self.settings["session_manager"].list_sessions()
+            session_kernel_ids = {
+                (s.get("kernel") or {}).get("id")
+                for s in sessions
+                if doc_path is not None and s.get("path") == doc_path
+            }
+            if kernel_id not in session_kernel_ids:
+                raise web.HTTPError(
+                    400,
+                    f"Kernel {kernel_id} does not belong to the session for "
+                    f"document {document_id!r}",
+                )
+
+            try:
+                await yroom.connect_kernel(kernel_manager)
+            except Exception as e:
+                # connect_kernel rolled the room back to unwired, so the next
+                # execute retries the wire; 503 marks this retryable rather
+                # than leaving a half-wired room that 400s forever.
+                self.log.warning(
+                    "Failed to reconnect room %r to kernel %s: %s",
+                    document_id,
+                    kernel_id,
+                    e,
+                )
+                raise web.HTTPError(503, f"Kernel {kernel_id} is not responding; retry")
+            if yroom.stopped:
+                # The room stopped while we were connecting; its stop
+                # callbacks have already run, so ours would never fire.
+                await yroom.disconnect_kernel()
+                raise web.HTTPError(503, f"Room {document_id!r} is shutting down; retry")
             yroom.add_stop_callback(
                 lambda: asyncio.create_task(yroom.disconnect_kernel())
             )
