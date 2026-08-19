@@ -74,6 +74,12 @@ class KernelExecuteHandler(ExecutionsAPIHandler):
         request_id = body.get("request_id")
         previous_request_id = body.get("previous_request_id")
 
+        self.log.info(
+            "execute POST: kernel=%s document=%r cells=%d",
+            kernel_id,
+            document_id,
+            len(cells_payload),
+        )
         yroom = self.settings["yroom_manager"].get_room(document_id)
         if yroom is None:
             raise web.HTTPError(400, f"No YRoom available for document: {document_id!r}")

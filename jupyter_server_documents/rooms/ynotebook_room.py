@@ -169,6 +169,13 @@ class YNotebookRoom(YRoom):
     async def _connect_kernel_locked(self, kernel_manager) -> None:
         from ..outputs import OutputProcessor
 
+        self.log.info(
+            "connect_kernel: room %r manager %s (already wired: %s)",
+            self.room_id,
+            hex(id(kernel_manager)),
+            self._kernel_client is not None,
+        )
+
         if self._kernel_client is not None:
             if self._kernel_manager is kernel_manager:
                 # A concurrent caller wired this exact kernel while we
@@ -508,7 +515,12 @@ class YNotebookRoom(YRoom):
             self.log.warning("Cell %s execution timed out", item.cell_id)
         except Exception as e:
             ycell["execution_state"] = "idle"
-            self.log.error("execute_cell error cell_id=%s: %s", item.cell_id, e)
+            # log.exception: several failure modes here raise with an empty
+            # str() (AssertionError, IndexError()); without the traceback the
+            # log line is undiagnosable.
+            self.log.exception(
+                "execute_cell error cell_id=%s (%s)", item.cell_id, type(e).__name__
+            )
 
     # ── Cell execution ────────────────────────────────────────────────────────────
 
@@ -544,6 +556,10 @@ class YNotebookRoom(YRoom):
         if (
             self._kernel_client is None or self._execution_queue is None
         ) and self._connect_lock.locked():
+            self.log.info(
+                "execute_cells: waiting for in-flight kernel connect in room %r",
+                self.room_id,
+            )
             # A kernel connect is in flight — create_session and the lazy
             # re-wire can race on a cold kernel, whose heartbeat poll
             # suspends. Wait for it to finish rather than failing a run the
