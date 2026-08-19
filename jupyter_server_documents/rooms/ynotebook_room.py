@@ -15,6 +15,7 @@ import struct
 from dataclasses import dataclass
 from queue import Empty
 
+import traitlets
 import zmq
 import zmq.asyncio
 from jupyter_core.utils import ensure_async
@@ -88,6 +89,7 @@ class _ExecutionItem:
     ycell: Any
     file_id: str
     clear_outputs: bool
+    client_id: Optional[str] = None
 
 
 class YNotebookRoom(YRoom):
@@ -100,6 +102,22 @@ class YNotebookRoom(YRoom):
     execution; outputs and execution state are written directly into the YDoc
     so all connected clients see them via normal Yjs sync.
     """
+
+    stop_on_error = traitlets.Enum(
+        values=["room", "client", "off"],
+        default_value="room",
+        config=True,
+        help=(
+            "What queued work an errored cell aborts. 'room' (default) drains "
+            "every queued cell in the document, matching what a real kernel's "
+            "stop_on_error has always done on a shared kernel — Run All stops "
+            "at the first error. 'client' drains only the erroring client's "
+            "queued cells, so a collaborator's independently queued run "
+            "survives. 'off' keeps executing past errors (the pre-fix "
+            "behavior). Cells submitted AFTER the error run normally in every "
+            "mode, exactly as with a real kernel."
+        ),
+    )
 
     # Class-level so tests can shrink them; instance code reads them via self.
     _heartbeat_timeout: float = 30.0
@@ -379,7 +397,9 @@ class YNotebookRoom(YRoom):
                         if not self._shell_confirmed:
                             continue
 
-                    await self._run_item(item)
+                    status = await self._run_item(item)
+                    if status == "error" and self.stop_on_error != "off":
+                        self._drain_after_error(item)
 
                 except asyncio.CancelledError:
                     # Worker was cancelled (kernel disconnect or server shutdown).
@@ -454,7 +474,50 @@ class YNotebookRoom(YRoom):
         # output is done, get the reply
         return await client._async_recv_reply(msg_id, timeout=None)
 
-    async def _run_item(self, item: _ExecutionItem) -> None:
+    def _drain_after_error(self, errored: _ExecutionItem) -> None:
+        """Abort queued work after an errored cell, per `stop_on_error`.
+
+        Mirrors the kernel-side abort that classic Jupyter relies on: with a
+        real kernel, Run All queues every request on the shell channel with
+        stop_on_error=True and the KERNEL throws away everything still queued
+        when a cell errors. This room feeds the kernel one cell at a time, so
+        the kernel never has a queue to abort — the room must do it, or Run
+        All plows straight past errors. Drained cells return to idle with
+        their (already cleared) outputs untouched, the same un-run look a
+        kernel-aborted cell has. Anything enqueued after this pass runs
+        normally, also matching the kernel.
+        """
+        assert self._execution_queue is not None
+        survivors: list[_ExecutionItem] = []
+        drained = 0
+        while not self._execution_queue.empty():
+            try:
+                queued = self._execution_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if (
+                self.stop_on_error == "room"
+                or queued.client_id == errored.client_id
+            ):
+                queued.ycell["execution_state"] = "idle"
+                drained += 1
+            else:
+                survivors.append(queued)
+            # Balance the get_nowait; survivors re-enter as new tasks below.
+            self._execution_queue.task_done()
+        for queued in survivors:
+            self._execution_queue.put_nowait(queued)
+        if drained:
+            self.log.info(
+                "Cell %s errored; aborted %d queued cell(s) in room %r "
+                "(stop_on_error=%s).",
+                errored.cell_id,
+                drained,
+                self.room_id,
+                self.stop_on_error,
+            )
+
+    async def _run_item(self, item: _ExecutionItem) -> Optional[str]:
         """Execute one queued cell using execute_interactive."""
         ycell = item.ycell
 
@@ -498,7 +561,7 @@ class YNotebookRoom(YRoom):
 
         try:
             assert self._kernel_client is not None
-            await self._execute_interactive(
+            reply = await self._execute_interactive(
                 str(ycell.get("source", "")),
                 output_hook,
             )
@@ -510,6 +573,7 @@ class YNotebookRoom(YRoom):
                 ycell["execution_count"] = _execution_count
             self.log.debug("execute_cell completed: cell_id=%s outputs_len=%s",
                           item.cell_id, len(ycell.get("outputs", [])))
+            return (reply.get("content") or {}).get("status")
         except TimeoutError:
             ycell["execution_state"] = "idle"
             self.log.warning("Cell %s execution timed out", item.cell_id)
@@ -521,6 +585,7 @@ class YNotebookRoom(YRoom):
             self.log.exception(
                 "execute_cell error cell_id=%s (%s)", item.cell_id, type(e).__name__
             )
+        return None
 
     # ── Cell execution ────────────────────────────────────────────────────────────
 
@@ -530,6 +595,7 @@ class YNotebookRoom(YRoom):
         clear_outputs: bool = False,
         request_id: Optional[str] = None,
         previous_request_id: Optional[str] = None,
+        client_id: Optional[str] = None,
     ) -> None:
         """Enqueue a batch of cells atomically and return immediately.
 
@@ -624,6 +690,7 @@ class YNotebookRoom(YRoom):
                 ycell=ycell,
                 file_id=file_id,
                 clear_outputs=clear_outputs,
+                client_id=client_id,
             ))
 
         # Signal that the whole batch has been enqueued.

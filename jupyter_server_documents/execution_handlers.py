@@ -167,6 +167,7 @@ class KernelExecuteHandler(ExecutionsAPIHandler):
                 clear_outputs=True,
                 request_id=request_id,
                 previous_request_id=previous_request_id,
+                client_id=client_id,
             )
         except SourceMismatchError as e:
             self.set_status(409)

@@ -526,3 +526,118 @@ class TestOutputHook:
         """
         cell, _ = await self._run_with_hook([])
         assert cell.get("execution_state") == "idle"
+
+
+# ── stop on error ─────────────────────────────────────────────────────────────
+
+class TestStopOnError:
+    """An errored cell must abort queued work, per the stop_on_error traitlet.
+
+    Classic Jupyter gets this from the KERNEL: Run All queues every request on
+    the shell channel and the kernel throws away everything still queued when
+    a cell errors. This room feeds the kernel one cell at a time, so the room
+    must implement the abort itself — before this, Run All plowed straight
+    past errors and executed every remaining cell.
+    """
+
+    async def _run_batch(self, scope, cells_spec, late_spec=None):
+        """cells_spec: list of (cell_id, client_id, status). Each cell's
+        source is its id so the fake executor can look up its scripted
+        status. Returns (executed_ids, cells_by_id)."""
+        from jupyter_server_documents.rooms.ynotebook_room import _source_hash
+
+        room = make_yroom()
+        room.stop_on_error = scope
+        room._kernel_client = MagicMock()
+        room._kernel_manager = MagicMock()
+        room._shell_confirmed = True
+        room.output_processor = MagicMock()
+
+        statuses = {cell_id: st for cell_id, _c, st in cells_spec}
+        if late_spec:
+            statuses.update({cell_id: st for cell_id, _c, st in late_spec})
+        mock_cells = [
+            {"id": cid, "source": cid, "cell_type": "code", "outputs": []}
+            for cid, _c, _s in cells_spec + (late_spec or [])
+        ]
+        mock_ydoc = MagicMock()
+        mock_ydoc.ycells = mock_cells
+        room.get_jupyter_ydoc = AsyncMock(return_value=mock_ydoc)
+
+        executed = []
+
+        async def fake_execute(code, output_hook=None):
+            executed.append(code)
+            return {"content": {"status": statuses[code]}}
+
+        room._execute_interactive = fake_execute
+
+        # Enqueue everything BEFORE the worker starts, modeling Run All's
+        # fire-and-forget burst landing ahead of execution.
+        room._execution_queue = asyncio.Queue()
+        for cell_id, client_id, _s in cells_spec:
+            await room.execute_cells(
+                [{"cell_id": cell_id, "source_hash": _source_hash(cell_id)}],
+                client_id=client_id,
+            )
+        room._execution_worker_task = asyncio.create_task(
+            room._execution_worker()
+        )
+        await room._execution_queue.join()
+
+        if late_spec:
+            # Work submitted AFTER the error must run normally.
+            for cell_id, client_id, _s in late_spec:
+                await room.execute_cells(
+                    [{"cell_id": cell_id, "source_hash": _source_hash(cell_id)}],
+                    client_id=client_id,
+                )
+            await room._execution_queue.join()
+
+        room._execution_worker_task.cancel()
+        await asyncio.gather(room._execution_worker_task, return_exceptions=True)
+        return executed, {c["id"]: c for c in mock_cells}
+
+    @pytest.mark.asyncio
+    async def test_room_scope_drains_everything_queued(self):
+        executed, cells = await self._run_batch(
+            "room",
+            [("c1", "alice", "ok"), ("c2", "alice", "error"),
+             ("c3", "bob", "ok"), ("c4", "alice", "ok")],
+        )
+        assert executed == ["c1", "c2"]
+        assert cells["c3"]["execution_state"] == "idle"
+        assert cells["c4"]["execution_state"] == "idle"
+
+    @pytest.mark.asyncio
+    async def test_client_scope_spares_other_clients(self):
+        executed, cells = await self._run_batch(
+            "client",
+            [("c1", "alice", "ok"), ("c2", "alice", "error"),
+             ("c3", "bob", "ok"), ("c4", "alice", "ok")],
+        )
+        assert executed == ["c1", "c2", "c3"]
+        assert cells["c4"]["execution_state"] == "idle"
+
+    @pytest.mark.asyncio
+    async def test_off_scope_keeps_executing(self):
+        executed, _cells = await self._run_batch(
+            "off",
+            [("c1", "alice", "ok"), ("c2", "alice", "error"),
+             ("c3", "alice", "ok")],
+        )
+        assert executed == ["c1", "c2", "c3"]
+
+    @pytest.mark.asyncio
+    async def test_work_submitted_after_the_error_runs(self):
+        executed, _cells = await self._run_batch(
+            "room",
+            [("c1", "alice", "error"), ("c2", "alice", "ok")],
+            late_spec=[("c5", "alice", "ok")],
+        )
+        assert executed == ["c1", "c5"]
+
+    @pytest.mark.asyncio
+    async def test_default_scope_is_room(self):
+        room = make_yroom()
+        assert room.stop_on_error == "room"
