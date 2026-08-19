@@ -33,6 +33,8 @@ def make_yroom():
     room._shell_confirmed = False
     room._execution_queue = None
     room._execution_worker_task = None
+    room._worker_busy = False
+    room._connect_lock = asyncio.Lock()
     room.output_processor = None
     room._enqueued_events = {}
     return room
@@ -168,23 +170,37 @@ class TestConnectKernel:
 
     @pytest.mark.asyncio
     async def test_reconnect_disconnects_existing_client(self):
-        """Calling connect_kernel twice must not leave orphaned ZMQ sockets.
+        """Connecting to a DIFFERENT kernel must not leave orphaned ZMQ
+        sockets: the old client is stopped first.
 
-        If a stale connection is in place when connect_kernel is called (e.g.
-        after a kernel restart), the old client must be stopped first.
+        Connecting again to the SAME kernel manager is a deliberate no-op
+        (see test below): create_session and the lazy execute re-wire can
+        race on a cold kernel, and the loser must not tear down the winner.
         """
         room = make_yroom()
         km, first_client = await connect(room)
-        _, second_client = make_mock_km()
+        km2, second_client = make_mock_km()
 
-        # Point the same km at a new client for the second connect
-
-        km.client_factory = MagicMock(return_value=second_client)
         with patch("jupyter_server_documents.outputs.OutputProcessor"):
-            await room.connect_kernel(km)
+            await room.connect_kernel(km2)
 
         first_client.stop_channels.assert_called_once()
         assert room._kernel_client is second_client
+        await room.disconnect_kernel()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_to_same_kernel_is_a_noop(self):
+        """A second connect to the same kernel manager must not disturb the
+        live connection — it is the losing side of the create_session /
+        lazy-re-wire race."""
+        room = make_yroom()
+        km, first_client = await connect(room)
+
+        with patch("jupyter_server_documents.outputs.OutputProcessor"):
+            await room.connect_kernel(km)
+
+        first_client.stop_channels.assert_not_called()
+        assert room._kernel_client is first_client
         await room.disconnect_kernel()
 
 

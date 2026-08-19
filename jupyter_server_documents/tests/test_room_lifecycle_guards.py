@@ -60,6 +60,64 @@ class _DeadKernelManager:
         return {"shell_port": 0}
 
 
+class _SlowStartKernelManager(_DeadKernelManager):
+    """A kernel manager whose kernel is COLD: the heartbeat answers only
+    after `hb_alive` is set, so `connect_kernel` genuinely suspends in its
+    heartbeat poll — the window in which a second connect can race it."""
+
+    def __init__(self):
+        super().__init__()
+        self.hb_started = asyncio.Event()
+        self.hb_alive = asyncio.Event()
+        self.clients_stopped = 0
+        manager = self
+
+        class _Client(_DeadKernelClient):
+            async def _async_is_alive(self):
+                manager.hb_started.set()
+                return manager.hb_alive.is_set()
+
+            async def _async_wait_for_ready(self, *a, **k):
+                return None
+
+            def stop_channels(self):
+                super().stop_channels()
+                manager.clients_stopped += 1
+
+        self.client_factory = _Client
+
+
+class TestConnectSerialization:
+    @pytest.mark.asyncio
+    async def test_concurrent_connects_to_same_kernel_do_not_cross(
+        self, make_yroom: MakeYRoom
+    ):
+        """create_session and the lazy re-wire can both call connect_kernel
+        for the same cold kernel. Pre-lock, the second saw a client already
+        assigned and disconnected it MID-SETUP — the worker then hit its
+        kernel-client assertion and the user's run silently never happened
+        (observed in fork CI's console-for-notebook integration test)."""
+        room = await make_yroom(file_type="notebook")
+        km = _SlowStartKernelManager()
+
+        t1 = asyncio.create_task(room.connect_kernel(km))
+        await asyncio.wait_for(km.hb_started.wait(), timeout=5)
+        # Connect 1 is suspended in the heartbeat poll; the racing re-wire
+        # arrives now.
+        t2 = asyncio.create_task(room.connect_kernel(km))
+        await asyncio.sleep(0.05)
+        km.hb_alive.set()  # kernel heartbeat comes up
+        await asyncio.wait_for(asyncio.gather(t1, t2), timeout=5)
+
+        # Neither connect may destroy the other's client, and the room must
+        # end fully wired with a live worker.
+        assert km.clients_stopped == 0
+        assert room.has_kernel_connection
+        assert room._execution_queue is not None
+        assert room._execution_worker_task is not None
+        assert not room._execution_worker_task.done()
+
+
 class TestGcExecutionGuard:
     @pytest.mark.asyncio
     async def test_gc_guard_blocks_running_cells(self, make_yroom: MakeYRoom):

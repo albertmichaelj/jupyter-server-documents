@@ -109,6 +109,13 @@ class YNotebookRoom(YRoom):
         self._execution_queue: asyncio.Queue | None = None
         self._execution_worker_task: asyncio.Task | None = None
         self._worker_busy: bool = False
+        # Serializes connect/disconnect. Two connects CAN race in production:
+        # create_session wires the room while an execute POST takes the lazy
+        # re-wire path, and on a cold kernel the heartbeat poll suspends long
+        # enough for them to interleave — the second connect's
+        # disconnect-before-reconnect then destroys the first mid-setup
+        # (observed as a worker AssertionError and a run that never happens).
+        self._connect_lock = asyncio.Lock()
         self.output_processor: OutputProcessor | None = None
         # Per-request ordering: maps request_id → Event that is set once the
         # request has been enqueued.  Lets a successor wait for its predecessor
@@ -144,15 +151,26 @@ class YNotebookRoom(YRoom):
     async def connect_kernel(self, kernel_manager) -> None:
         """Attach this room to a running kernel.
 
-        If already connected, disconnects cleanly before reconnecting.
-        Creates a fresh client (independent session to avoid ZMQ DEALER
-        identity collisions), waits for heartbeat, starts the execution
-        queue + worker, then fetches kernel info.
+        If already connected to a DIFFERENT kernel, disconnects cleanly before
+        reconnecting; a connect that lost a race to a concurrent connect to
+        the same kernel is a no-op. Creates a fresh client (independent
+        session to avoid ZMQ DEALER identity collisions), waits for
+        heartbeat, starts the execution queue + worker, then fetches kernel
+        info. Serialized per room by `_connect_lock`.
         """
+        async with self._connect_lock:
+            await self._connect_kernel_locked(kernel_manager)
+
+    async def _connect_kernel_locked(self, kernel_manager) -> None:
         from ..outputs import OutputProcessor
 
         if self._kernel_client is not None:
-            await self.disconnect_kernel()
+            if self._kernel_manager is kernel_manager:
+                # A concurrent caller wired this exact kernel while we
+                # awaited the lock (create_session racing the lazy re-wire).
+                # Reconnecting would tear down a live worker for nothing.
+                return
+            await self._disconnect_kernel_locked()
 
         self._kernel_manager = kernel_manager
         kernel_manager.add_restart_callback(self._on_kernel_restart, "restart")
@@ -195,7 +213,12 @@ class YNotebookRoom(YRoom):
         await self._fetch_kernel_info()
 
     async def disconnect_kernel(self) -> None:
-        """Detach from the kernel. Cancels the execution worker and drains the queue."""
+        """Detach from the kernel. Cancels the execution worker and drains
+        the queue. Serialized against connects by `_connect_lock`."""
+        async with self._connect_lock:
+            await self._disconnect_kernel_locked()
+
+    async def _disconnect_kernel_locked(self) -> None:
         if self._kernel_manager is not None:
             try:
                 self._kernel_manager.remove_restart_callback(self._on_kernel_restart, "restart")
@@ -456,6 +479,16 @@ class YNotebookRoom(YRoom):
             previous_request_id: Wait for this predecessor batch to be fully
                 enqueued before enqueuing any cell in this batch.
         """
+        if (
+            self._kernel_client is None or self._execution_queue is None
+        ) and self._connect_lock.locked():
+            # A kernel connect is in flight — create_session and the lazy
+            # re-wire can race on a cold kernel, whose heartbeat poll
+            # suspends. Wait for it to finish rather than failing a run the
+            # user legitimately issued.
+            async with self._connect_lock:
+                pass
+
         if self._kernel_client is None:
             raise RuntimeError("YNotebookRoom is not connected to a kernel")
         if self._execution_queue is None:
