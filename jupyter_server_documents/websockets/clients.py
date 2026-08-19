@@ -133,16 +133,25 @@ class YjsClientGroup:
     def get(self, client_id: str) -> YjsClient:
         """
         Gets a client from its ID.
+
+        Raises `KeyError` if the client is not in the group or its WebSocket
+        connection is already gone. A queued message can outlive its sender
+        (tab closed while the message sat behind an in-flight handshake), so
+        callers on the message path must treat this as "client gone" — never
+        let it propagate into the message-queue task.
         """
-        if client_id in self.desynced: 
-            client = self.desynced[client_id]
-        if client_id in self.synced:
-            client = self.synced[client_id]
+        client = self.desynced.get(client_id)
+        if client is None:
+            client = self.synced.get(client_id)
+        if client is None:
+            raise KeyError(
+                f"The client_id '{client_id}' is not found in client group in room '{self.room_id}'"
+            )
         if client.websocket and client.websocket.ws_connection:
             return client
-        error_message = f"The client_id '{client_id}' is not found in client group in room '{self.room_id}'"
-        self.log.error(error_message)
-        raise Exception(error_message)
+        raise KeyError(
+            f"The client '{client_id}' in room '{self.room_id}' has no live websocket connection"
+        )
 
     def get_all(self, synced_only: bool = True) -> list[YjsClient]:
         """

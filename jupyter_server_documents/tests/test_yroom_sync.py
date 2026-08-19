@@ -604,3 +604,143 @@ class TestAwarenessOnConnect:
         # Every awareness snapshot arrives after the SS2 sync reply that ran
         # mark_synced -- so a desynced client is never sent one.
         assert min(awareness_idxs) > first_sync_idx
+
+
+class TestQueueRobustness:
+    """No queued message may ever kill the room's message loop.
+
+    A queued message can outlive its sender (tab closed while the message sat
+    behind an in-flight handshake); processing it must not raise into
+    `_process_message_queue`, or the room silently freezes for every client.
+    """
+
+    @pytest.mark.asyncio
+    async def test_queued_update_from_removed_client_does_not_kill_loop(
+        self, make_yroom: MakeYRoom
+    ):
+        yroom = await make_yroom()
+
+        # Client A is synced and healthy.
+        ws_a = FakeWebSocket()
+        await _complete_handshake(yroom, ws_a)
+
+        # A SyncUpdate arrives from a client that is no longer in the group
+        # (its tab closed while the message was queued).
+        ghost_doc = Doc()
+        ghost_doc["source"] = Text()
+        ghost_doc["source"] += "ghost edit"
+        poison = pycrdt.create_update_message(ghost_doc.get_update())
+        yroom.add_message("ghost-client-id", poison)
+        await asyncio.sleep(0.1)
+
+        # The loop must survive: a NEW client's handshake (which flows through
+        # the same queue) must still complete.
+        ws_b = FakeWebSocket()
+        cid_b = yroom.clients.add(ws_b)
+        yroom.add_message(cid_b, ws_b.build_ss1())
+        await asyncio.sleep(0.1)
+        ss2_reply = ws_b.process_server_messages()
+        assert ss2_reply is not None, (
+            "Message loop died processing a message from a removed client"
+        )
+        yroom.add_message(cid_b, ss2_reply)
+        await asyncio.sleep(0.1)
+        assert yroom.clients.get(cid_b).synced
+
+    @pytest.mark.asyncio
+    async def test_get_raises_keyerror_for_unknown_client(
+        self, make_yroom: MakeYRoom
+    ):
+        yroom = await make_yroom()
+        with pytest.raises(KeyError):
+            yroom.clients.get("never-existed")
+
+
+class TestDeadlineRace:
+    """A SyncStep2 resolved in the same event-loop iteration as the handshake
+    deadline must still be applied (Python >= 3.12 `wait_for` returns
+    TimeoutError even when the awaited future holds a result)."""
+
+    @pytest.mark.asyncio
+    async def test_ss2_resolved_at_deadline_is_applied(
+        self, make_yroom: MakeYRoom, monkeypatch: pytest.MonkeyPatch
+    ):
+        yroom = await make_yroom()
+
+        # Force the race deterministically: for the pending-SS2 future only,
+        # wait until the result has been delivered, then raise TimeoutError
+        # anyway — exactly what CPython >= 3.12 does when the deadline timer
+        # fires in the same iteration that resolved the future.
+        real_wait_for = asyncio.wait_for
+
+        async def racing_wait_for(awaitable, timeout=None):
+            if any(awaitable is f for f in yroom._pending_ss2.values()):
+                await asyncio.shield(awaitable)
+                raise asyncio.TimeoutError()
+            return await real_wait_for(awaitable, timeout)
+
+        monkeypatch.setattr(asyncio, "wait_for", racing_wait_for)
+
+        ws = FakeWebSocket()
+        ws.doc["source"] += "client content that must survive the race"
+        cid = yroom.clients.add(ws)
+        yroom.add_message(cid, ws.build_ss1())
+        await asyncio.sleep(0.1)
+        ss2_reply = ws.process_server_messages()
+        assert ss2_reply is not None
+        yroom.add_message(cid, ss2_reply)
+        await asyncio.sleep(0.2)
+
+        ydoc = await yroom.get_ydoc()
+        assert "client content that must survive the race" in str(ydoc["source"])
+        # And the client must still be connected.
+        assert not ws.closed
+
+
+class TestStopDrain:
+    """stop(immediately=False) must not lose queued messages or drop async
+    teardown work."""
+
+    @pytest.mark.asyncio
+    async def test_stop_drain_applies_queued_ss2(self, make_yroom: MakeYRoom):
+        yroom = await make_yroom()
+        ws = FakeWebSocket()
+        await _complete_handshake(yroom, ws)
+
+        # The client makes an edit and answers a server SS1 with an SS2 that
+        # is the sole carrier of that edit.
+        ws.doc["source"] += "edit carried only by the SS2"
+        ydoc = await yroom.get_ydoc()
+        server_ss1 = pycrdt.create_sync_message(ydoc)
+        ss2 = pycrdt.handle_sync_message(server_ss1[1:], ws.doc)
+        assert ss2 is not None and ss2[1] == YSyncMessageSubtype.SYNC_STEP2
+
+        # The SS2 sits in the queue when the room stops (no await between
+        # enqueue and stop, so the message loop cannot consume it first).
+        yroom._message_queue.put_nowait((yroom.clients.get_all()[0].id, ss2))
+        yroom.stop()
+
+        # The synchronous drain in stop() must have applied it to the YDoc.
+        assert "edit carried only by the SS2" in str(ydoc["source"])
+
+    @pytest.mark.asyncio
+    async def test_stop_awaits_task_returning_callbacks(
+        self, make_yroom: MakeYRoom
+    ):
+        yroom = await make_yroom()
+        done = asyncio.Event()
+
+        async def teardown():
+            await asyncio.sleep(0.3)
+            done.set()
+
+        # Registration sites (session_manager, the execution handler) return
+        # an already-scheduled Task from the callback, not a coroutine.
+        yroom.add_stop_callback(lambda: asyncio.create_task(teardown()))
+
+        yroom.stop()
+        await yroom.until_saved
+        assert done.is_set(), (
+            "stop() dropped a Task returned by a stop callback; teardown "
+            "raced shutdown"
+        )
