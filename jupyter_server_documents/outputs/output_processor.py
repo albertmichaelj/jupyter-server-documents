@@ -92,6 +92,10 @@ class OutputProcessor(LoggingConfigurable):
             self.outputs_manager.get_output_index(display_id)
             if display_id and self.use_outputs_service else None
         )
+        # This output came from the user's own kernel, in a session the user
+        # started, so it is trusted -- mark it before it lands in the cell.
+        self._mark_trusted(ycell)
+
         outputs = ycell["outputs"]
         if output_index is not None and output_index < len(outputs):
             outputs[output_index] = output
@@ -102,6 +106,50 @@ class OutputProcessor(LoggingConfigurable):
                     f"(outputs length: {len(outputs)}), appending instead."
                 )
             outputs.append(output)
+
+    def _mark_trusted(self, ycell) -> None:
+        """Mark a cell's outputs as trusted.
+
+        WHY THIS EXISTS. Jupyter's trust model asks one question of a rich
+        output: did this user's own kernel produce it, in a session this user
+        started? In classic Jupyter the FRONTEND answers it -- outputs arrive
+        over the kernel websocket it opened, so it marks them trusted. Here the
+        server writes outputs straight into the shared document and the
+        frontend only sees a document change, with no provenance attached, so
+        nobody was answering the question at all.
+
+        The consequences were quiet and confusing. `NotebookNotary._check_cell`
+        refuses to trust any cell holding an `execute_result` or `display_data`
+        with data keys unless `metadata.trusted` is set, and
+        `ContentsManager.save` only signs a notebook when EVERY cell passes --
+        logging "Notebook X is not trusted" otherwise. An unsigned notebook has
+        its HTML output sanitized in the browser, which strips `<style>`. That
+        is why a scikit-learn or XGBoost estimator repr rendered as its
+        plain-text fallback plus an unstyled list of parameters instead of the
+        collapsible diagram: the markup survived, the CSS did not.
+
+        Setting the flag here is the same answer classic Jupyter gives, at the
+        only place that knows it: output the server just produced. It does NOT
+        trust output that was already in the file when the room loaded -- those
+        cells keep whatever trust they arrived with, so a downloaded notebook's
+        saved outputs are still sanitized until re-executed.
+
+        `jupyter_ydoc` sets this same field on the cells it creates
+        ("auto-created empty code cell without outputs ought be trusted"), so
+        the key round-trips through the shared model and out to nbformat.
+
+        Wrapped defensively: a cell that renders its output is worth more than
+        one that is correctly trusted, so a metadata quirk must never take the
+        output path down with it.
+        """
+        try:
+            metadata = ycell.get("metadata")
+            if metadata is None:
+                ycell["metadata"] = {"trusted": True}
+            elif not metadata.get("trusted", False):
+                metadata["trusted"] = True
+        except Exception:
+            self.log.debug("Could not mark cell as trusted.", exc_info=True)
 
     def _clear_ycell_outputs(self, ycell, file_id: str | None, cell_id: str):
         del ycell["outputs"][:]
