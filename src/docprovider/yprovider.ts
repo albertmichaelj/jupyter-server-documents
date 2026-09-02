@@ -20,6 +20,11 @@ import * as Y from 'yjs';
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
 import { WebsocketProvider as YWebsocketProvider } from 'y-websocket';
+import {
+  ALIVE_STAMP_INTERVAL_MS,
+  bumpConnectionEpoch,
+  shouldBumpEpoch
+} from './executionChain';
 import { requestAPI } from './requests';
 import { JupyterFrontEnd } from '@jupyterlab/application';
 import { DocumentWidget } from '@jupyterlab/docregistry';
@@ -284,7 +289,13 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
             provider.doc,
             serverStateVector
           );
-          applyServerUpdate(provider.doc, serverUpdate, divergent, provider);
+          applyServerUpdate(
+            provider.doc,
+            serverUpdate,
+            divergent,
+            provider,
+            serverStateVector
+          );
           if (emitSynced && !provider.synced) {
             provider.synced = true;
           }
@@ -310,7 +321,15 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
   get wsProvider() {
     return this._yWebsocketProvider;
   }
+  private _clearAliveInterval(): void {
+    if (this._aliveIntervalId !== null) {
+      window.clearInterval(this._aliveIntervalId);
+      this._aliveIntervalId = null;
+    }
+  }
+
   private _disconnect(): void {
+    this._clearAliveInterval();
     this._yWebsocketProvider?.off('connection-close', this._onConnectionClosed);
     this._yWebsocketProvider?.off('sync', this._onSync);
     this._yWebsocketProvider?.off('status', this._onStatus);
@@ -359,6 +378,25 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
    */
   private _onStatus = ({ status }: { status: string }): void => {
     if (status === 'connected') {
+      // Invalidate the execution-request chain when the room's
+      // enqueued-request history may not have survived (room GC +
+      // recreation), so no request chains onto a predecessor the new room
+      // will never see. Gated on time since last KNOWN ALIVE — an
+      // interval-refreshed stamp, not the 'disconnected' event time, because
+      // during laptop sleep no JS runs and the disconnect is only delivered
+      // at wake, seconds before the reconnect. After a short awake blip the
+      // room is guaranteed alive, and there the chain must be preserved — it
+      // is the FIFO protection for a request in flight across the blip.
+      const roomName = this._yWebsocketProvider?.roomname;
+      if (roomName && shouldBumpEpoch(this._lastAliveAt, Date.now())) {
+        bumpConnectionEpoch(roomName);
+      }
+      this._lastAliveAt = Date.now();
+      if (this._aliveIntervalId === null) {
+        this._aliveIntervalId = window.setInterval(() => {
+          this._lastAliveAt = Date.now();
+        }, ALIVE_STAMP_INTERVAL_MS);
+      }
       if (WebSocketProvider._reconnectedManually) {
         console.info('WebSocket reconnected successfully.');
         WebSocketProvider._reconnectedManually = false;
@@ -371,6 +409,9 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
     }
 
     // status === 'disconnected'
+    // Stop refreshing the liveness stamp; it now marks when the connection
+    // was last known up, and downtime accumulates against it.
+    this._clearAliveInterval();
     this._reconnectAttempts++;
 
     if (this._reconnectAttempts > WebSocketProvider.MAX_RECONNECT_ATTEMPTS) {
@@ -517,6 +558,8 @@ export class WebSocketProvider implements IDocumentProvider, IForkProvider {
   private _trans: TranslationBundle;
   private _fileId: string | null = null;
   private _reconnectAttempts = 0;
+  private _lastAliveAt: number | null = null;
+  private _aliveIntervalId: number | null = null;
 
   /**
    * Reference to the global retry dialog.
@@ -600,14 +643,28 @@ export namespace WebSocketProvider {
  * under its own clientID, and the server has re-authored the equivalent
  * content under a new ID — so failing to clear would duplicate it.
  */
-function hasDivergentHistory(
+export function hasDivergentHistory(
   doc: Y.Doc,
   serverStateVector: Uint8Array
 ): boolean {
   const clientSV = Y.decodeStateVector(Y.encodeStateVector(doc));
   const serverSV = Y.decodeStateVector(serverStateVector);
-  for (const clientId of clientSV.keys()) {
-    if (!serverSV.has(clientId)) {
+  for (const [clientId, clientClock] of clientSV) {
+    const serverClock = serverSV.get(clientId);
+    if (serverClock === undefined) {
+      return true;
+    }
+    // Presence is not enough: compare clocks for every clientID other than
+    // our own. If the server covers only a PREFIX of a stale clientID's
+    // history (an earlier-reconnecting tab repaired first and taught the
+    // recreated room part of the dead session's IDs), the uncovered tail
+    // would sync as live items alongside the server's re-authored copy of
+    // the same content — permanent duplication on disk. A live room can
+    // never lack history another client relayed through it, so a non-self
+    // clock overhang always means stale history. Our OWN overhang is the
+    // normal signature of legitimate offline edits and must not trigger
+    // the repair.
+    if (clientId !== doc.clientID && clientClock > serverClock) {
       return true;
     }
   }
@@ -628,7 +685,7 @@ function hasDivergentHistory(
  * (the persisted file is the source of truth).
  *
  * Key-based content (`Y.Map` entries, `Y.XmlElement` attributes) is left
- * untouched — see `clearSharedType`. Deleting a key tombstones the client's
+ * untouched — see `deleteItemsUnknownToServer`. Deleting a key tombstones the client's
  * item for it, and Yjs reads a key as the *rightmost* item or `undefined` if
  * that item is deleted; it does not fall back to a live concurrent item. So if
  * the client's clientID outranks the server's, the cleared key reads as
@@ -641,35 +698,70 @@ function hasDivergentHistory(
  * attributed to the provider and not re-broadcast to the server as a separate
  * update message; in the divergent case the tombstones reach the server via
  * the SS2 reply instead.
+ *
+ * THE REPAIR IS IDEMPOTENT, and that is load-bearing. Only items the server
+ * does not know (their ID is not covered by `serverStateVector`) are deleted.
+ * An earlier version cleared the FULL ordered range, which is correct on the
+ * first pass but destructive on a second: if the first repair's SS2 reply is
+ * lost, the next handshake is divergent again, and a full clear then deletes
+ * the SERVER'S OWN ITEMS — applied at the server, that empties the document
+ * on disk (observed in production as notebooks truncated to one blank cell).
+ * Deleting only server-unknown items makes any number of repair passes safe:
+ * pass N+1 finds the server's items covered by its state vector and leaves
+ * them alone.
  */
-function applyServerUpdate(
+export function applyServerUpdate(
   doc: Y.Doc,
   serverUpdate: Uint8Array,
   divergent: boolean,
-  origin?: unknown
+  origin?: unknown,
+  serverStateVector?: Uint8Array
 ): void {
-  if (!divergent) {
+  if (!divergent || serverStateVector === undefined) {
     Y.applyUpdate(doc, serverUpdate, origin);
     return;
   }
 
+  const serverSV = Y.decodeStateVector(serverStateVector);
+  const spareOwnFrom = lastRepairEndClock.get(doc);
   doc.transact(() => {
     for (const [, type] of doc.share) {
-      clearSharedType(type);
+      deleteItemsUnknownToServer(type, serverSV, doc.clientID, spareOwnFrom);
     }
     Y.applyUpdate(doc, serverUpdate);
   }, origin);
+  // Record where our own history stands now that this repair committed.
+  // Items we create from here on postdate the dead room's content and can
+  // never duplicate the re-authored disk copy, so if THIS repair's SS2 reply
+  // is lost and another pass runs, that pass must spare them — otherwise a
+  // new cell typed between two handshakes is silently deleted everywhere.
+  lastRepairEndClock.set(
+    doc,
+    Y.decodeStateVector(Y.encodeStateVector(doc)).get(doc.clientID) ?? 0
+  );
 }
 
 /**
- * Clears the ordered content of a top-level Yjs shared type so the server's
- * state (applied next) replaces it. Considers every Yjs shared type:
+ * Own clock recorded at the commit of each divergent repair, per doc. Items
+ * our client created at or beyond this clock postdate the room's death; a
+ * later repair pass must not delete them. (Deletions carry no clock, so the
+ * repair itself does not advance it — the boundary is exactly "everything I
+ * had when the repair ran".)
+ */
+const lastRepairEndClock = new WeakMap<Y.Doc, number>();
+
+/**
+ * Deletes the ordered content of a top-level Yjs shared type that the server
+ * does not already know, so the server's state (applied next) replaces the
+ * client-only content without duplicating — and without ever touching items
+ * the server owns, which is what makes the repair idempotent. Considers every
+ * Yjs shared type:
  *
- *  - Ordered types — content is cleared:
+ *  - Ordered types — server-unknown items are deleted:
  *      - `Y.Array`, `Y.Text` (and `Y.XmlText`, which extends it): delete the
- *        full index range.
+ *        index ranges of items not covered by the server's state vector.
  *      - `Y.XmlElement` / `Y.XmlFragment` (`Y.XmlElement` extends
- *        `Y.XmlFragment`): delete all child nodes.
+ *        `Y.XmlFragment`): likewise, over child nodes.
  *  - Key-based content — intentionally left intact:
  *      - `Y.Map` entries (and `Y.XmlHook`, which extends `Y.Map`), and
  *        `Y.XmlElement` attributes.
@@ -679,22 +771,68 @@ function applyServerUpdate(
  *    it lets the server's value resolve via last-writer-wins (never absent).
  *    Key-based types don't duplicate, so they never needed clearing anyway.
  */
-function clearSharedType(type: Y.AbstractType<any>): void {
+export function deleteItemsUnknownToServer(
+  type: Y.AbstractType<any>,
+  serverSV: Map<number, number>,
+  ownClientID?: number,
+  spareOwnFromClock?: number
+): void {
   // Key-based: skip (clearing can drop the key entirely — see above).
   if (type instanceof Y.Map) {
     return;
   }
 
-  // Ordered: clear the full sequence. `Y.Text` also covers `Y.XmlText`.
-  if (type instanceof Y.Array || type instanceof Y.Text) {
-    type.delete(0, type.length);
+  // Ordered types only. `Y.Text` also covers `Y.XmlText`; `Y.XmlElement`
+  // extends `Y.XmlFragment`. Attributes on XML elements are key-based and
+  // left intact for the reason above.
+  const ordered =
+    type instanceof Y.Array ||
+    type instanceof Y.Text ||
+    type instanceof Y.XmlFragment;
+  if (!ordered) {
     return;
   }
 
-  // `Y.XmlElement` extends `Y.XmlFragment`. Clear child nodes only; element
-  // attributes are key-based and left intact for the reason above.
-  if (type instanceof Y.XmlFragment) {
-    type.delete(0, type.length);
-    return;
+  // Walk the item chain, collecting [index, length] ranges whose IDs the
+  // server's state vector does NOT cover. An item spans clocks
+  // [id.clock, id.clock + length); the server knows the prefix up to
+  // serverSV.get(id.client). A partially-covered item contributes only its
+  // uncovered suffix; `type.delete` splits items as needed.
+  //
+  // Index bookkeeping matches `type.delete` semantics: only non-deleted,
+  // countable items occupy indices (formatting marks in Y.Text are not
+  // countable and are skipped, exactly as the previous full-range clear
+  // left them in place).
+  const ranges: Array<[number, number]> = [];
+  let index = 0;
+  let item: any = (type as any)._start;
+  while (item !== null) {
+    if (!item.deleted && item.countable) {
+      const known = serverSV.get(item.id.client) ?? 0;
+      const coveredLen = Math.max(
+        0,
+        Math.min(item.length, known - item.id.clock)
+      );
+      // Spare our own items created after the previous repair committed:
+      // they postdate the dead room's content, so they cannot duplicate the
+      // re-authored disk copy — deleting them would destroy legitimate work
+      // typed between two handshakes. (No item straddles the boundary: it
+      // is our own clock at the previous commit, and items existing then
+      // lie entirely below it.)
+      const spared =
+        spareOwnFromClock !== undefined &&
+        item.id.client === ownClientID &&
+        item.id.clock >= spareOwnFromClock;
+      if (!spared && coveredLen < item.length) {
+        ranges.push([index + coveredLen, item.length - coveredLen]);
+      }
+      index += item.length;
+    }
+    item = item.right;
+  }
+
+  // Delete back-to-front so earlier indices stay valid.
+  for (let i = ranges.length - 1; i >= 0; i--) {
+    type.delete(ranges[i][0], ranges[i][1]);
   }
 }

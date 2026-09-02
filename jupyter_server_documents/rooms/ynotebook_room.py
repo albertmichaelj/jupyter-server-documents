@@ -13,6 +13,12 @@ from typing import TYPE_CHECKING, Any, Optional
 import asyncio
 import struct
 from dataclasses import dataclass
+from queue import Empty
+
+import traitlets
+import zmq
+import zmq.asyncio
+from jupyter_core.utils import ensure_async
 
 from .yroom import YRoom
 
@@ -83,6 +89,7 @@ class _ExecutionItem:
     ycell: Any
     file_id: str
     clear_outputs: bool
+    client_id: Optional[str] = None
 
 
 class YNotebookRoom(YRoom):
@@ -96,6 +103,26 @@ class YNotebookRoom(YRoom):
     so all connected clients see them via normal Yjs sync.
     """
 
+    stop_on_error = traitlets.Enum(
+        values=["room", "client", "off"],
+        default_value="room",
+        config=True,
+        help=(
+            "What queued work an errored cell aborts. 'room' (default) drains "
+            "every queued cell in the document, matching what a real kernel's "
+            "stop_on_error has always done on a shared kernel — Run All stops "
+            "at the first error. 'client' drains only the erroring client's "
+            "queued cells, so a collaborator's independently queued run "
+            "survives. 'off' keeps executing past errors (the pre-fix "
+            "behavior). Cells submitted AFTER the error run normally in every "
+            "mode, exactly as with a real kernel."
+        ),
+    )
+
+    # Class-level so tests can shrink them; instance code reads them via self.
+    _heartbeat_timeout: float = 30.0
+    _kernel_info_timeout: float = 30.0
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Kernel connection state — set by connect_kernel(), cleared by disconnect_kernel()
@@ -104,6 +131,14 @@ class YNotebookRoom(YRoom):
         self._shell_confirmed: bool = False
         self._execution_queue: asyncio.Queue | None = None
         self._execution_worker_task: asyncio.Task | None = None
+        self._worker_busy: bool = False
+        # Serializes connect/disconnect. Two connects CAN race in production:
+        # create_session wires the room while an execute POST takes the lazy
+        # re-wire path, and on a cold kernel the heartbeat poll suspends long
+        # enough for them to interleave — the second connect's
+        # disconnect-before-reconnect then destroys the first mid-setup
+        # (observed as a worker AssertionError and a run that never happens).
+        self._connect_lock = asyncio.Lock()
         self.output_processor: OutputProcessor | None = None
         # Per-request ordering: maps request_id → Event that is set once the
         # request has been enqueued.  Lets a successor wait for its predecessor
@@ -112,24 +147,87 @@ class YNotebookRoom(YRoom):
 
     # ── Kernel client lifecycle ───────────────────────────────────────────────────
 
+    @property
+    def has_kernel_connection(self) -> bool:
+        """Whether this room currently has a live kernel client attached.
+
+        False for a room that was garbage-collected and later re-created:
+        the room→kernel bond is only formed in ``create_session`` and the
+        old room's stop callback tore it down, so the new room starts
+        unwired even though its session and kernel are still alive.
+        """
+        return self._kernel_client is not None
+
+    @property
+    def has_pending_executions(self) -> bool:
+        """Whether any execution is queued or in flight for this room.
+
+        Read by the room GC (`YRoomManager._should_free_room`) so a room is
+        never freed while server-side execution is running — freeing would
+        cancel the worker mid-execution and drop the outputs into a stopped
+        room after the enqueue already returned 200.
+        """
+        if self._worker_busy:
+            return True
+        return self._execution_queue is not None and not self._execution_queue.empty()
+
     async def connect_kernel(self, kernel_manager) -> None:
         """Attach this room to a running kernel.
 
-        If already connected, disconnects cleanly before reconnecting.
-        Creates a fresh client (independent session to avoid ZMQ DEALER
-        identity collisions), waits for heartbeat, starts the execution
-        queue + worker, then fetches kernel info.
+        If already connected to a DIFFERENT kernel, disconnects cleanly before
+        reconnecting; a connect that lost a race to a concurrent connect to
+        the same kernel is a no-op. Creates a fresh client (independent
+        session to avoid ZMQ DEALER identity collisions), waits for
+        heartbeat, starts the execution queue + worker, then fetches kernel
+        info. Serialized per room by `_connect_lock`.
         """
+        async with self._connect_lock:
+            await self._connect_kernel_locked(kernel_manager)
+
+    async def _connect_kernel_locked(self, kernel_manager) -> None:
         from ..outputs import OutputProcessor
 
+        self.log.info(
+            "connect_kernel: room %r manager %s (already wired: %s)",
+            self.room_id,
+            hex(id(kernel_manager)),
+            self._kernel_client is not None,
+        )
+
         if self._kernel_client is not None:
-            await self.disconnect_kernel()
+            if self._kernel_manager is kernel_manager:
+                # A concurrent caller wired this exact kernel while we
+                # awaited the lock (create_session racing the lazy re-wire).
+                # Reconnecting would tear down a live worker for nothing.
+                return
+            await self._disconnect_kernel_locked()
 
         self._kernel_manager = kernel_manager
         kernel_manager.add_restart_callback(self._on_kernel_restart, "restart")
         kernel_manager.add_restart_callback(self._on_kernel_dead, "dead")
 
-        await self._connect_client(kernel_manager)
+        try:
+            await self._connect_client(kernel_manager)
+        except Exception:
+            # Roll back the half-wired state. _connect_client assigns
+            # _kernel_client and starts channels BEFORE its heartbeat wait,
+            # and has_kernel_connection keys on _kernel_client — without this
+            # rollback, a failed connect (dead or wedged kernel) leaves every
+            # subsequent execute skipping the re-wire and failing with
+            # "execution worker is not running" until the kernel is replaced.
+            if self._kernel_client is not None:
+                try:
+                    self._kernel_client.stop_channels()
+                except Exception:
+                    self.log.exception("Error stopping channels during connect rollback:")
+                self._kernel_client = None
+            try:
+                kernel_manager.remove_restart_callback(self._on_kernel_restart, "restart")
+                kernel_manager.remove_restart_callback(self._on_kernel_dead, "dead")
+            except Exception:
+                self.log.exception("Error removing restart callbacks during connect rollback:")
+            self._kernel_manager = None
+            raise
 
         # Start queue + worker BEFORE fetching kernel_info so that execute_cell()
         # can enqueue items immediately.  Items wait in the worker until
@@ -145,7 +243,12 @@ class YNotebookRoom(YRoom):
         await self._fetch_kernel_info()
 
     async def disconnect_kernel(self) -> None:
-        """Detach from the kernel. Cancels the execution worker and drains the queue."""
+        """Detach from the kernel. Cancels the execution worker and drains
+        the queue. Serialized against connects by `_connect_lock`."""
+        async with self._connect_lock:
+            await self._disconnect_kernel_locked()
+
+    async def _disconnect_kernel_locked(self) -> None:
         if self._kernel_manager is not None:
             try:
                 self._kernel_manager.remove_restart_callback(self._on_kernel_restart, "restart")
@@ -237,7 +340,7 @@ class YNotebookRoom(YRoom):
         # The heartbeat channel starts paused; unpause it before polling.
         # Without this _async_is_alive() always returns False.
         self._kernel_client.hb_channel.unpause()
-        deadline = asyncio.get_event_loop().time() + 30.0
+        deadline = asyncio.get_event_loop().time() + self._heartbeat_timeout
         while not await self._kernel_client._async_is_alive():
             if asyncio.get_event_loop().time() > deadline:
                 raise RuntimeError(
@@ -264,7 +367,7 @@ class YNotebookRoom(YRoom):
         try:
             assert self._kernel_client is not None
             await asyncio.wait_for(
-                self._kernel_client._async_wait_for_ready(), timeout=30.0
+                self._kernel_client._async_wait_for_ready(), timeout=self._kernel_info_timeout
             )
         except Exception as e:
             self.log.warning("_fetch_kernel_info: failed: %s", e)
@@ -280,6 +383,7 @@ class YNotebookRoom(YRoom):
         try:
             while True:
                 item = await self._execution_queue.get()
+                self._worker_busy = True
                 try:
                     # Wait for kernel_info to be fetched (connect_kernel is async).
                     if not self._shell_confirmed:
@@ -293,7 +397,9 @@ class YNotebookRoom(YRoom):
                         if not self._shell_confirmed:
                             continue
 
-                    await self._run_item(item)
+                    status = await self._run_item(item)
+                    if status == "error" and self.stop_on_error != "off":
+                        self._drain_after_error(item)
 
                 except asyncio.CancelledError:
                     # Worker was cancelled (kernel disconnect or server shutdown).
@@ -305,11 +411,113 @@ class YNotebookRoom(YRoom):
                     item.ycell["execution_state"] = "idle"
                     self.log.error("Execution worker error for cell %s: %s", item.cell_id, e)
                 finally:
+                    self._worker_busy = False
                     self._execution_queue.task_done()
         except asyncio.CancelledError:
             pass
 
-    async def _run_item(self, item: _ExecutionItem) -> None:
+    async def _execute_interactive(self, code: str, output_hook) -> dict:
+        """Send an execute_request and collect its output.
+
+        Adapted from jupyter_client 8.9.1 ``_async_execute_interactive``
+        (BSD), reduced to this room's call shape (output_hook set,
+        allow_stdin=False, no timeout, no stdin hook) with one behavioral
+        fix: the upstream output loop polls the raw iopub SOCKET and then
+        reads the iopub CHANNEL with ``get_msg(timeout=0)``. Under asyncio
+        the channel's own zero-timeout poll can miss the event the outer
+        poll reported, and the escaping ``queue.Empty`` killed an execution
+        whose request was ALREADY SENT — the kernel runs the cell, every
+        output is lost, and the cell shows idle with no result (reproduced
+        in fork CI's console-for-notebook test on a cold kernel). A spurious
+        wakeup must simply re-enter the poll loop.
+        """
+        client = self._kernel_client
+        assert client is not None
+        if not client.iopub_channel.is_alive():
+            raise RuntimeError("IOPub channel must be running to receive output")
+
+        msg_id = await ensure_async(client.execute(code, allow_stdin=False))
+
+        poller = zmq.asyncio.Poller()
+        iopub_socket = client.iopub_channel.socket
+        poller.register(iopub_socket, zmq.POLLIN)
+        try:
+            while True:
+                events = dict(await poller.poll(None))
+                if iopub_socket not in events:
+                    continue
+                try:
+                    msg = await ensure_async(
+                        client.iopub_channel.get_msg(timeout=0)
+                    )
+                except Empty:
+                    # Spurious wakeup: the socket-level poll fired but the
+                    # channel had nothing yet. Poll again — this is the one
+                    # divergence from upstream, where Empty escapes and
+                    # aborts the collection.
+                    continue
+
+                if msg["parent_header"].get("msg_id") != msg_id:
+                    # not from my request
+                    continue
+                output_hook(msg)
+
+                # stop on idle
+                if (
+                    msg["header"]["msg_type"] == "status"
+                    and msg["content"]["execution_state"] == "idle"
+                ):
+                    break
+        finally:
+            poller.unregister(iopub_socket)
+
+        # output is done, get the reply
+        return await client._async_recv_reply(msg_id, timeout=None)
+
+    def _drain_after_error(self, errored: _ExecutionItem) -> None:
+        """Abort queued work after an errored cell, per `stop_on_error`.
+
+        Mirrors the kernel-side abort that classic Jupyter relies on: with a
+        real kernel, Run All queues every request on the shell channel with
+        stop_on_error=True and the KERNEL throws away everything still queued
+        when a cell errors. This room feeds the kernel one cell at a time, so
+        the kernel never has a queue to abort — the room must do it, or Run
+        All plows straight past errors. Drained cells return to idle with
+        their (already cleared) outputs untouched, the same un-run look a
+        kernel-aborted cell has. Anything enqueued after this pass runs
+        normally, also matching the kernel.
+        """
+        assert self._execution_queue is not None
+        survivors: list[_ExecutionItem] = []
+        drained = 0
+        while not self._execution_queue.empty():
+            try:
+                queued = self._execution_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if (
+                self.stop_on_error == "room"
+                or queued.client_id == errored.client_id
+            ):
+                queued.ycell["execution_state"] = "idle"
+                drained += 1
+            else:
+                survivors.append(queued)
+            # Balance the get_nowait; survivors re-enter as new tasks below.
+            self._execution_queue.task_done()
+        for queued in survivors:
+            self._execution_queue.put_nowait(queued)
+        if drained:
+            self.log.info(
+                "Cell %s errored; aborted %d queued cell(s) in room %r "
+                "(stop_on_error=%s).",
+                errored.cell_id,
+                drained,
+                self.room_id,
+                self.stop_on_error,
+            )
+
+    async def _run_item(self, item: _ExecutionItem) -> Optional[str]:
         """Execute one queued cell using execute_interactive."""
         ycell = item.ycell
 
@@ -353,10 +561,9 @@ class YNotebookRoom(YRoom):
 
         try:
             assert self._kernel_client is not None
-            await self._kernel_client._async_execute_interactive(
+            reply = await self._execute_interactive(
                 str(ycell.get("source", "")),
-                output_hook=output_hook,
-                allow_stdin=False,
+                output_hook,
             )
             # Write execution_count and state together so the frontend
             # sees them in the same YDoc transaction — avoids a brief
@@ -366,12 +573,19 @@ class YNotebookRoom(YRoom):
                 ycell["execution_count"] = _execution_count
             self.log.debug("execute_cell completed: cell_id=%s outputs_len=%s",
                           item.cell_id, len(ycell.get("outputs", [])))
+            return (reply.get("content") or {}).get("status")
         except TimeoutError:
             ycell["execution_state"] = "idle"
             self.log.warning("Cell %s execution timed out", item.cell_id)
         except Exception as e:
             ycell["execution_state"] = "idle"
-            self.log.error("execute_cell error cell_id=%s: %s", item.cell_id, e)
+            # log.exception: several failure modes here raise with an empty
+            # str() (AssertionError, IndexError()); without the traceback the
+            # log line is undiagnosable.
+            self.log.exception(
+                "execute_cell error cell_id=%s (%s)", item.cell_id, type(e).__name__
+            )
+        return None
 
     # ── Cell execution ────────────────────────────────────────────────────────────
 
@@ -381,6 +595,7 @@ class YNotebookRoom(YRoom):
         clear_outputs: bool = False,
         request_id: Optional[str] = None,
         previous_request_id: Optional[str] = None,
+        client_id: Optional[str] = None,
     ) -> None:
         """Enqueue a batch of cells atomically and return immediately.
 
@@ -404,10 +619,35 @@ class YNotebookRoom(YRoom):
             previous_request_id: Wait for this predecessor batch to be fully
                 enqueued before enqueuing any cell in this batch.
         """
+        if (
+            self._kernel_client is None or self._execution_queue is None
+        ) and self._connect_lock.locked():
+            self.log.info(
+                "execute_cells: waiting for in-flight kernel connect in room %r",
+                self.room_id,
+            )
+            # A kernel connect is in flight — create_session and the lazy
+            # re-wire can race on a cold kernel, whose heartbeat poll
+            # suspends. Wait for it to finish rather than failing a run the
+            # user legitimately issued.
+            async with self._connect_lock:
+                pass
+
         if self._kernel_client is None:
             raise RuntimeError("YNotebookRoom is not connected to a kernel")
         if self._execution_queue is None:
             raise RuntimeError("YNotebookRoom execution worker is not running")
+
+        if not self._shell_confirmed:
+            # The wire-up may have happened while the kernel was busy (the
+            # lazy re-wire runs at execute time, unlike create_session):
+            # _fetch_kernel_info's readiness wait then timed out and nothing
+            # retried it, so every execution was accepted and silently
+            # skipped by the worker — permanently, even after the kernel went
+            # idle. Re-attempt from request context, which matches
+            # connect_kernel's calling context (see _fetch_kernel_info's note
+            # on pyzmq + wait_for inside worker Tasks).
+            await self._fetch_kernel_info()
 
         # Wait for predecessor batch to finish enqueuing.
         if previous_request_id:
@@ -450,6 +690,7 @@ class YNotebookRoom(YRoom):
                 ycell=ycell,
                 file_id=file_id,
                 clear_outputs=clear_outputs,
+                client_id=client_id,
             ))
 
         # Signal that the whole batch has been enqueued.

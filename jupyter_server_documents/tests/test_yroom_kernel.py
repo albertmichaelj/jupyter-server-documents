@@ -33,6 +33,8 @@ def make_yroom():
     room._shell_confirmed = False
     room._execution_queue = None
     room._execution_worker_task = None
+    room._worker_busy = False
+    room._connect_lock = asyncio.Lock()
     room.output_processor = None
     room._enqueued_events = {}
     return room
@@ -168,23 +170,37 @@ class TestConnectKernel:
 
     @pytest.mark.asyncio
     async def test_reconnect_disconnects_existing_client(self):
-        """Calling connect_kernel twice must not leave orphaned ZMQ sockets.
+        """Connecting to a DIFFERENT kernel must not leave orphaned ZMQ
+        sockets: the old client is stopped first.
 
-        If a stale connection is in place when connect_kernel is called (e.g.
-        after a kernel restart), the old client must be stopped first.
+        Connecting again to the SAME kernel manager is a deliberate no-op
+        (see test below): create_session and the lazy execute re-wire can
+        race on a cold kernel, and the loser must not tear down the winner.
         """
         room = make_yroom()
         km, first_client = await connect(room)
-        _, second_client = make_mock_km()
+        km2, second_client = make_mock_km()
 
-        # Point the same km at a new client for the second connect
-
-        km.client_factory = MagicMock(return_value=second_client)
         with patch("jupyter_server_documents.outputs.OutputProcessor"):
-            await room.connect_kernel(km)
+            await room.connect_kernel(km2)
 
         first_client.stop_channels.assert_called_once()
         assert room._kernel_client is second_client
+        await room.disconnect_kernel()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_to_same_kernel_is_a_noop(self):
+        """A second connect to the same kernel manager must not disturb the
+        live connection — it is the losing side of the create_session /
+        lazy-re-wire race."""
+        room = make_yroom()
+        km, first_client = await connect(room)
+
+        with patch("jupyter_server_documents.outputs.OutputProcessor"):
+            await room.connect_kernel(km)
+
+        first_client.stop_channels.assert_not_called()
+        assert room._kernel_client is first_client
         await room.disconnect_kernel()
 
 
@@ -340,12 +356,14 @@ class TestExecuteCell:
         room.get_jupyter_ydoc = AsyncMock(return_value=mock_ydoc)
 
         executed = asyncio.Event()
+        captured = {}
 
-        async def fake_execute(code, **kwargs):
+        async def fake_execute(code, output_hook=None):
+            captured["code"] = code
             executed.set()
             return {"status": "ok"}
 
-        room._kernel_client._async_execute_interactive = fake_execute
+        room._execute_interactive = fake_execute
         room._execution_queue = asyncio.Queue()
         room._execution_worker_task = asyncio.create_task(room._execution_worker())
 
@@ -355,39 +373,64 @@ class TestExecuteCell:
         room._execution_worker_task.cancel()
         await asyncio.gather(room._execution_worker_task, return_exceptions=True)
 
+        assert captured["code"] == "print('hello')"
+
     @pytest.mark.asyncio
     async def test_stdin_disabled(self):
-        """allow_stdin must be False — server-side execution cannot prompt the user."""
+        """allow_stdin must be False — server-side execution cannot prompt
+        the user. Enforced inside the vendored _execute_interactive when it
+        sends the execute_request, so asserted at the client.execute seam."""
+        import zmq
+        import zmq.asyncio
+
         room = make_yroom()
-        room._kernel_client = MagicMock()
-        room._kernel_manager = MagicMock()
-        room._shell_confirmed = True
-        room.output_processor = MagicMock()
+        ctx = zmq.asyncio.Context()
+        recv_sock = ctx.socket(zmq.PULL)
+        port = recv_sock.bind_to_random_port("tcp://127.0.0.1")
+        send_sock = ctx.socket(zmq.PUSH)
+        send_sock.connect(f"tcp://127.0.0.1:{port}")
 
-        mock_cell = {"id": "cell-1", "source": "x=1", "cell_type": "code", "outputs": []}
-        mock_ydoc = MagicMock()
-        mock_ydoc.ycells = [mock_cell]
-        room.get_jupyter_ydoc = AsyncMock(return_value=mock_ydoc)
+        captured = {}
+        script = [
+            {
+                "parent_header": {"msg_id": "m1"},
+                "header": {"msg_type": "status"},
+                "content": {"execution_state": "idle"},
+            },
+        ]
 
-        captured_kwargs = {}
-        executed = asyncio.Event()
+        class _Chan:
+            socket = recv_sock
 
-        async def fake_execute(code, **kwargs):
-            captured_kwargs.update(kwargs)
-            executed.set()
-            return {"status": "ok"}
+            def is_alive(self):
+                return True
 
-        room._kernel_client._async_execute_interactive = fake_execute
-        room._execution_queue = asyncio.Queue()
-        room._execution_worker_task = asyncio.create_task(room._execution_worker())
+            async def get_msg(self, timeout=0):
+                await recv_sock.recv()
+                return script.pop(0)
 
-        await room.execute_cell("cell-1", source_hash="2878563358")
-        await asyncio.wait_for(executed.wait(), timeout=2.0)
+        class _Client:
+            iopub_channel = _Chan()
 
-        room._execution_worker_task.cancel()
-        await asyncio.gather(room._execution_worker_task, return_exceptions=True)
+            def execute(self, code, allow_stdin=None):
+                captured["allow_stdin"] = allow_stdin
+                return "m1"
 
-        assert captured_kwargs.get("allow_stdin") is False
+            async def _async_recv_reply(self, mid, timeout=None):
+                return {"content": {"status": "ok"}}
+
+        room._kernel_client = _Client()
+        try:
+            await send_sock.send(b"x")
+            await asyncio.wait_for(
+                room._execute_interactive("x=1", lambda m: None), timeout=10
+            )
+        finally:
+            recv_sock.close(0)
+            send_sock.close(0)
+            ctx.term()
+
+        assert captured["allow_stdin"] is False
 
 
 # ── output_hook routing ───────────────────────────────────────────────────────
@@ -417,14 +460,14 @@ class TestOutputHook:
 
         executed = asyncio.Event()
 
-        async def fake_execute(code, output_hook=None, **kwargs):
+        async def fake_execute(code, output_hook=None):
             for msg in messages:
                 if output_hook:
                     output_hook(msg)
             executed.set()
             return {"status": "ok"}
 
-        room._kernel_client._async_execute_interactive = fake_execute
+        room._execute_interactive = fake_execute
         room._execution_queue = asyncio.Queue()
         room._execution_worker_task = asyncio.create_task(room._execution_worker())
 
@@ -483,3 +526,118 @@ class TestOutputHook:
         """
         cell, _ = await self._run_with_hook([])
         assert cell.get("execution_state") == "idle"
+
+
+# ── stop on error ─────────────────────────────────────────────────────────────
+
+class TestStopOnError:
+    """An errored cell must abort queued work, per the stop_on_error traitlet.
+
+    Classic Jupyter gets this from the KERNEL: Run All queues every request on
+    the shell channel and the kernel throws away everything still queued when
+    a cell errors. This room feeds the kernel one cell at a time, so the room
+    must implement the abort itself — before this, Run All plowed straight
+    past errors and executed every remaining cell.
+    """
+
+    async def _run_batch(self, scope, cells_spec, late_spec=None):
+        """cells_spec: list of (cell_id, client_id, status). Each cell's
+        source is its id so the fake executor can look up its scripted
+        status. Returns (executed_ids, cells_by_id)."""
+        from jupyter_server_documents.rooms.ynotebook_room import _source_hash
+
+        room = make_yroom()
+        room.stop_on_error = scope
+        room._kernel_client = MagicMock()
+        room._kernel_manager = MagicMock()
+        room._shell_confirmed = True
+        room.output_processor = MagicMock()
+
+        statuses = {cell_id: st for cell_id, _c, st in cells_spec}
+        if late_spec:
+            statuses.update({cell_id: st for cell_id, _c, st in late_spec})
+        mock_cells = [
+            {"id": cid, "source": cid, "cell_type": "code", "outputs": []}
+            for cid, _c, _s in cells_spec + (late_spec or [])
+        ]
+        mock_ydoc = MagicMock()
+        mock_ydoc.ycells = mock_cells
+        room.get_jupyter_ydoc = AsyncMock(return_value=mock_ydoc)
+
+        executed = []
+
+        async def fake_execute(code, output_hook=None):
+            executed.append(code)
+            return {"content": {"status": statuses[code]}}
+
+        room._execute_interactive = fake_execute
+
+        # Enqueue everything BEFORE the worker starts, modeling Run All's
+        # fire-and-forget burst landing ahead of execution.
+        room._execution_queue = asyncio.Queue()
+        for cell_id, client_id, _s in cells_spec:
+            await room.execute_cells(
+                [{"cell_id": cell_id, "source_hash": _source_hash(cell_id)}],
+                client_id=client_id,
+            )
+        room._execution_worker_task = asyncio.create_task(
+            room._execution_worker()
+        )
+        await room._execution_queue.join()
+
+        if late_spec:
+            # Work submitted AFTER the error must run normally.
+            for cell_id, client_id, _s in late_spec:
+                await room.execute_cells(
+                    [{"cell_id": cell_id, "source_hash": _source_hash(cell_id)}],
+                    client_id=client_id,
+                )
+            await room._execution_queue.join()
+
+        room._execution_worker_task.cancel()
+        await asyncio.gather(room._execution_worker_task, return_exceptions=True)
+        return executed, {c["id"]: c for c in mock_cells}
+
+    @pytest.mark.asyncio
+    async def test_room_scope_drains_everything_queued(self):
+        executed, cells = await self._run_batch(
+            "room",
+            [("c1", "alice", "ok"), ("c2", "alice", "error"),
+             ("c3", "bob", "ok"), ("c4", "alice", "ok")],
+        )
+        assert executed == ["c1", "c2"]
+        assert cells["c3"]["execution_state"] == "idle"
+        assert cells["c4"]["execution_state"] == "idle"
+
+    @pytest.mark.asyncio
+    async def test_client_scope_spares_other_clients(self):
+        executed, cells = await self._run_batch(
+            "client",
+            [("c1", "alice", "ok"), ("c2", "alice", "error"),
+             ("c3", "bob", "ok"), ("c4", "alice", "ok")],
+        )
+        assert executed == ["c1", "c2", "c3"]
+        assert cells["c4"]["execution_state"] == "idle"
+
+    @pytest.mark.asyncio
+    async def test_off_scope_keeps_executing(self):
+        executed, _cells = await self._run_batch(
+            "off",
+            [("c1", "alice", "ok"), ("c2", "alice", "error"),
+             ("c3", "alice", "ok")],
+        )
+        assert executed == ["c1", "c2", "c3"]
+
+    @pytest.mark.asyncio
+    async def test_work_submitted_after_the_error_runs(self):
+        executed, _cells = await self._run_batch(
+            "room",
+            [("c1", "alice", "error"), ("c2", "alice", "ok")],
+            late_spec=[("c5", "alice", "ok")],
+        )
+        assert executed == ["c1", "c5"]
+
+    @pytest.mark.asyncio
+    async def test_default_scope_is_room(self):
+        room = make_yroom()
+        assert room.stop_on_error == "room"

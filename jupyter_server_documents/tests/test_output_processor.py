@@ -197,3 +197,96 @@ def test_process_output_dispatches_clear():
     op, _ = _make_processor()
     op.process_output("clear_output", ycell, None, "cell-1", {"wait": False})
     assert len(ycell["outputs"]) == 0
+
+
+# ── Output trust ──────────────────────────────────────────────────────────────
+#
+# Jupyter sanitizes HTML output from notebooks it does not trust, which strips
+# <style> and reduces a scikit-learn / XGBoost estimator repr to its plain-text
+# fallback plus an unstyled parameter list. A cell holding rich output is only
+# trusted if `metadata.trusted` is set, and the server writing outputs into the
+# shared document is the only party that knows the output came from this user's
+# own kernel.
+
+
+def _rich_output_content():
+    """An execute_result whose HTML carries CSS -- the case that breaks."""
+    return {
+        "data": {
+            "text/html": "<style>#sk-1 {color: red}</style><div id='sk-1'>XGBRegressor</div>",
+            "text/plain": "XGBRegressor(...)",
+        },
+        "metadata": {},
+        "execution_count": 1,
+    }
+
+
+def _notebook_from_cell(ycell):
+    """Wrap a processed cell in a minimal notebook so the real notary can rule
+    on it. Copies are deliberate: `_check_cell` POPS `trusted`, so a shared
+    dict would make the second assertion depend on the first."""
+    import nbformat
+
+    nb = nbformat.v4.new_notebook()
+    cell = nbformat.v4.new_code_cell(source="model.fit(X, y)")
+    cell["outputs"] = [nbformat.from_dict(dict(o)) for o in ycell["outputs"]]
+    cell["metadata"] = dict(ycell.get("metadata") or {})
+    nb.cells.append(cell)
+    return nb
+
+
+def test_writing_output_marks_the_cell_trusted():
+    ycell = _make_ycell()
+    op, _ = _make_processor(use_outputs_service=False)
+    op.process_output("execute_result", ycell, None, "cell-1", _rich_output_content())
+    assert ycell["metadata"]["trusted"] is True
+
+
+def test_trust_is_idempotent_and_preserves_other_metadata():
+    ycell = _make_ycell()
+    ycell["metadata"] = {"tags": ["keep-me"]}
+    op, _ = _make_processor(use_outputs_service=False)
+    for _ in range(3):
+        op.process_output("execute_result", ycell, None, "cell-1", _rich_output_content())
+    assert ycell["metadata"]["trusted"] is True
+    assert ycell["metadata"]["tags"] == ["keep-me"]
+
+
+def test_trust_survives_clear_output():
+    """clear_output empties the outputs; it must not un-trust the cell."""
+    ycell = _make_ycell()
+    op, _ = _make_processor(use_outputs_service=False)
+    op.process_output("execute_result", ycell, None, "cell-1", _rich_output_content())
+    op.process_output("clear_output", ycell, None, "cell-1", {"wait": False})
+    assert ycell["outputs"] == []
+    assert ycell["metadata"]["trusted"] is True
+
+
+def test_a_cell_without_metadata_does_not_break_output():
+    """The write path must survive a cell shaped unexpectedly -- rendering the
+    output matters more than recording trust."""
+    ycell = {"outputs": [], "cell_type": "code"}
+    op, _ = _make_processor(use_outputs_service=False)
+    op.process_output("stream", ycell, None, "cell-1", {"text": "hi", "name": "stdout"})
+    assert len(ycell["outputs"]) == 1
+
+
+def test_notary_would_sign_the_notebook_after_server_execution():
+    """The contract that actually matters: `ContentsManager.save` signs a
+    notebook only when `NotebookNotary.check_cells` passes, and an unsigned
+    notebook gets its HTML sanitized in the browser."""
+    from nbformat.sign import NotebookNotary
+
+    ycell = _make_ycell()
+    op, _ = _make_processor(use_outputs_service=False)
+    op.process_output("execute_result", ycell, None, "cell-1", _rich_output_content())
+
+    with TemporaryDirectory() as tmp:
+        notary = NotebookNotary(data_dir=tmp)
+        assert notary.check_cells(_notebook_from_cell(ycell)) is True
+
+        # And the same cell WITHOUT the flag -- the pre-fix state -- is refused,
+        # which is what left every estimator repr unstyled.
+        untrusted = _notebook_from_cell(ycell)
+        untrusted.cells[0]["metadata"].pop("trusted", None)
+        assert notary.check_cells(untrusted) is False

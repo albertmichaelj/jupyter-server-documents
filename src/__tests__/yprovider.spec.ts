@@ -11,6 +11,10 @@ import {
   waitForDialog
 } from '@jupyterlab/testutils';
 import { requestAPI } from '../docprovider/requests';
+import {
+  getConnectionEpoch,
+  EPOCH_BUMP_MIN_DOWNTIME_MS
+} from '../docprovider/executionChain';
 import { WebSocketProvider } from '../docprovider/yprovider';
 
 jest.mock('../docprovider/requests', () => ({
@@ -256,6 +260,76 @@ describe('WebSocketProvider reconnection', () => {
       expect(console.info).toHaveBeenCalledWith(
         'WebSocket reconnected successfully.'
       );
+      provider.dispose();
+    });
+  });
+
+  describe('_onStatus execution-chain epoch', () => {
+    it('bumps the epoch only when downtime could have outlived the room', async () => {
+      const provider = createProvider();
+      const wsProvider = await waitForProviderConnect(provider);
+      // roomName is `${format}:${contentType}:${fileId}` from _connect.
+      const room = 'json:notebook:test-file-id';
+
+      const nowSpy = jest.spyOn(Date, 'now');
+      try {
+        nowSpy.mockReturnValue(100_000);
+        wsProvider.emit('status', { status: 'connected' });
+        const base = getConnectionEpoch(room);
+
+        // Short blip: the room is guaranteed alive, and the chain is the
+        // FIFO protection for a request in flight across the blip — it must
+        // survive.
+        wsProvider.emit('status', { status: 'disconnected' });
+        nowSpy.mockReturnValue(102_000);
+        wsProvider.emit('status', { status: 'connected' });
+        expect(getConnectionEpoch(room)).toBe(base);
+
+        // Walk-away: downtime is measured against the last liveness stamp
+        // (taken at the previous 'connected'), and retry cycles emitting
+        // further 'disconnected' events must not refresh it. Past the gate
+        // the chain must break.
+        nowSpy.mockReturnValue(102_000);
+        wsProvider.emit('status', { status: 'disconnected' });
+        nowSpy.mockReturnValue(102_000 + EPOCH_BUMP_MIN_DOWNTIME_MS - 1_000);
+        wsProvider.emit('status', { status: 'disconnected' });
+        nowSpy.mockReturnValue(102_000 + EPOCH_BUMP_MIN_DOWNTIME_MS);
+        wsProvider.emit('status', { status: 'connected' });
+        expect(getConnectionEpoch(room)).toBe(base + 1);
+      } finally {
+        nowSpy.mockRestore();
+      }
+      provider.dispose();
+    });
+
+    it('bumps after a sleep even though the disconnect is only observed at wake', async () => {
+      // During laptop sleep no JS runs: the 'disconnected' event for a
+      // connection that died at sleep start is only DELIVERED at wake,
+      // seconds before the reconnect completes. Measuring downtime from
+      // that event made a 20-minute lid close look like a 3-second blip
+      // and the epoch never bumped — the gate must instead measure from
+      // the last time the connection was known alive.
+      const provider = createProvider();
+      const wsProvider = await waitForProviderConnect(provider);
+      const room = 'json:notebook:test-file-id';
+
+      const nowSpy = jest.spyOn(Date, 'now');
+      try {
+        nowSpy.mockReturnValue(500_000);
+        wsProvider.emit('status', { status: 'connected' });
+        const base = getConnectionEpoch(room);
+
+        // Lid closes; JS freezes; nothing fires for 20 minutes. At wake,
+        // the stale-connection close and the reconnect land back-to-back.
+        const wake = 500_000 + 20 * 60_000;
+        nowSpy.mockReturnValue(wake);
+        wsProvider.emit('status', { status: 'disconnected' });
+        nowSpy.mockReturnValue(wake + 3_000);
+        wsProvider.emit('status', { status: 'connected' });
+        expect(getConnectionEpoch(room)).toBe(base + 1);
+      } finally {
+        nowSpy.mockRestore();
+      }
       provider.dispose();
     });
   });

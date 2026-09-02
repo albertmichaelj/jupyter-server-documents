@@ -33,6 +33,8 @@ def make_room():
     room._shell_confirmed = True
     room._execution_queue = asyncio.Queue()
     room._execution_worker_task = MagicMock(done=MagicMock(return_value=False))
+    room._worker_busy = False
+    room._connect_lock = asyncio.Lock()
     room.output_processor = None
     room._enqueued_events = {}
     return room
