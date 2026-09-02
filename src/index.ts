@@ -167,7 +167,8 @@ export const serverCellExecutorPlugin: JupyterFrontEndPlugin<INotebookCellExecut
           const previousRequestId = executionChain.next(
             docKey,
             epoch,
-            requestId
+            requestId,
+            kernelId
           );
 
           if (!documentId) {

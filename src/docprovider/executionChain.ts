@@ -98,12 +98,44 @@ export class ExecutionChain {
   /**
    * Record `requestId` as the newest request for `docKey` and return the id
    * it should chain to: the previous request iff it was issued in the same
-   * connection epoch, else undefined (start a fresh chain).
+   * connection epoch AND against the same kernel, else undefined (start a
+   * fresh chain).
+   *
+   * The kernel check is what stops a chain from spanning a kernel swap. The
+   * server keeps its enqueued-request history on the room and clears it in
+   * `_disconnect_kernel_locked`, which `_connect_kernel_locked` calls whenever
+   * it is handed a different kernel manager — i.e. every time the notebook
+   * gets a NEW kernel (shut down and start, or Change Kernel). A chain that
+   * survives that names a predecessor the server has just forgotten, and the
+   * successor waits the full predecessor timeout and fails with 408.
+   *
+   * Reproduced on demand, 2026-09-02: run a cell, shut the kernel down, run a
+   * cell without reloading the page — the second cell hangs 10.00s and never
+   * runs; a further run succeeds because `clear()` has since broken the chain.
+   * With Run All the whole batch is issued before the first 408 returns, so
+   * the entire run is lost, which is how this presented as a dead notebook.
+   *
+   * Note a UI **Restart** Kernel is NOT affected and must not be conflated
+   * with it: `restart_kernel()` reuses the same manager object and fires no
+   * restart callbacks, so nothing clears the server's history and the chain
+   * stays valid. Only a different manager triggers the teardown.
+   *
+   * Not covered: a room garbage-collected and re-created while bound to the
+   * same kernel also starts with an empty history, and the client has no
+   * signal for it short of a reconnect long enough to bump the epoch. That
+   * case still costs one failed request, which `clear()` then recovers.
    */
-  next(docKey: string, epoch: number, requestId: string): string | undefined {
+  next(
+    docKey: string,
+    epoch: number,
+    requestId: string,
+    kernelId: string
+  ): string | undefined {
     const prev = this._last.get(docKey);
-    this._last.set(docKey, { epoch, requestId });
-    return prev && prev.epoch === epoch ? prev.requestId : undefined;
+    this._last.set(docKey, { epoch, requestId, kernelId });
+    return prev && prev.epoch === epoch && prev.kernelId === kernelId
+      ? prev.requestId
+      : undefined;
   }
 
   /**
@@ -139,5 +171,8 @@ export class ExecutionChain {
     }
   }
 
-  private _last = new Map<string, { epoch: number; requestId: string }>();
+  private _last = new Map<
+    string,
+    { epoch: number; requestId: string; kernelId: string }
+  >();
 }
