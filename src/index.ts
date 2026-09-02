@@ -163,9 +163,10 @@ export const serverCellExecutorPlugin: JupyterFrontEndPlugin<INotebookCellExecut
           // cells simultaneously don't block each other.
           const docKey = `${documentId ?? path}:${clientId}`;
           const requestId = crypto.randomUUID();
+          const epoch = getConnectionEpoch(documentId ?? path);
           const previousRequestId = executionChain.next(
             docKey,
-            getConnectionEpoch(documentId ?? path),
+            epoch,
             requestId
           );
 
@@ -198,7 +199,7 @@ export const serverCellExecutorPlugin: JupyterFrontEndPlugin<INotebookCellExecut
               // pressed Run. Show a visible warning so the user knows to re-run.
               // Clear the ordering chain: this request was never enqueued on the
               // server so the next run must not reference it as a predecessor.
-              executionChain.clear(docKey, requestId);
+              executionChain.clear(docKey, epoch);
               Notification.warning(
                 'Cell not executed: the cell source changed while the request was in flight. Please re-run the cell.',
                 { autoClose: 5000 }
@@ -209,14 +210,14 @@ export const serverCellExecutorPlugin: JupyterFrontEndPlugin<INotebookCellExecut
             if (!response.ok) {
               // Any other failure (408, 500, etc.) also breaks the chain —
               // the request was never successfully enqueued.
-              executionChain.clear(docKey, requestId);
+              executionChain.clear(docKey, epoch);
             }
             onCellExecuted({ cell, success: response.ok });
             return response.ok;
           } catch (error) {
             // Unknown outcome (network error) — the request may never have
             // been enqueued, so the next run must not chain onto it.
-            executionChain.clear(docKey, requestId);
+            executionChain.clear(docKey, epoch);
             onCellExecuted({ cell, success: false });
             if (!cell.isDisposed) {
               throw error;

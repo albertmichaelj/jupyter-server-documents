@@ -107,14 +107,34 @@ export class ExecutionChain {
   }
 
   /**
-   * Forget the chain for `docKey` iff its newest entry is `requestId`.
+   * Forget the chain for `docKey` iff its newest entry is from `epoch`.
    * Called when a request fails: an id that was never enqueued on the server
-   * must not be named as a predecessor. Scoped to the failed id because a
-   * newer request may already be registered (and in flight) — a stale
-   * failure must not unchain it.
+   * must not be named as a predecessor.
+   *
+   * Scoped to the EPOCH, not to the failed request id. Scoping to the id was
+   * too narrow and cost a user a dead notebook: within one epoch the chain is
+   * a linked list, so a newer entry chained (transitively) onto the failed
+   * request, and the server makes a successor wait for a predecessor that was
+   * never enqueued. That successor is therefore already doomed — there is no
+   * healthy in-flight request to protect, and leaving it registered hands the
+   * poison to everything issued after it.
+   *
+   * Run All makes this permanent rather than transient. It issues N requests
+   * before any response returns, so `_last` is already the Nth by the time the
+   * first failure arrives and every id-scoped clear is a no-op; each retry
+   * inside the server's 10s predecessor timeout then re-chains onto a doomed
+   * request. Observed in production: every execute returning 408 "Timed out
+   * waiting for previous_request_id to be enqueued" for eleven minutes, with
+   * no cell ever running. Nothing server-side could clear it — the poisoned
+   * state is in this map — so closing the notebook, shutting down the kernel
+   * and restarting it all failed. Only reloading the browser page recovered.
+   *
+   * The epoch is what the original scoping was really reaching for: a newer
+   * request from a LATER epoch began a fresh chain after a reconnect and must
+   * survive a late failure from the old one.
    */
-  clear(docKey: string, requestId: string): void {
-    if (this._last.get(docKey)?.requestId === requestId) {
+  clear(docKey: string, epoch: number): void {
+    if (this._last.get(docKey)?.epoch === epoch) {
       this._last.delete(docKey);
     }
   }
