@@ -389,6 +389,40 @@ class TestExecuteCell:
 
         assert captured_kwargs.get("allow_stdin") is False
 
+    @pytest.mark.asyncio
+    async def test_disconnect_while_waiting_for_document_leaves_cell_untouched(self):
+        """The room can be disconnected from its kernel (for example when its
+        session is deleted or switched to another kernel) while execute_cell()
+        awaits the document. That cancels the worker and drops the queue, so
+        the request must fail as one sent to a disconnected room would
+        (RuntimeError, which the handler turns into a 400) and leave the cell
+        as it was, not marked running with nothing left to run it."""
+        room = make_yroom()
+        await connect(room)
+        room._shell_confirmed = True
+
+        mock_cell = {"id": "cell-1", "source": "1+1", "cell_type": "code", "outputs": []}
+        mock_ydoc = MagicMock()
+        mock_ydoc.ycells = [mock_cell]
+        loading = asyncio.Event()
+        document_loaded = asyncio.Event()
+
+        async def get_jupyter_ydoc():
+            loading.set()
+            await document_loaded.wait()
+            return mock_ydoc
+
+        room.get_jupyter_ydoc = get_jupyter_ydoc
+        request = asyncio.create_task(room.execute_cell("cell-1", source_hash="2728614991"))
+        await asyncio.wait_for(loading.wait(), timeout=1.0)
+
+        await room.disconnect_kernel()
+        document_loaded.set()
+
+        with pytest.raises(RuntimeError, match="execution worker is not running"):
+            await request
+        assert "execution_state" not in mock_cell
+
 
 # ── output_hook routing ───────────────────────────────────────────────────────
 

@@ -484,12 +484,23 @@ class YNotebookRoom(YRoom):
                 raise SourceMismatchError(cell_id)
             items.append((cell_id, ycell))
 
+        # The room may have been disconnected from its kernel while this
+        # request awaited its predecessor or the document (for example, its
+        # session was deleted or switched to another kernel).
+        # disconnect_kernel() cancels the worker and sets the queue to None,
+        # so check again before touching any cell, or the cell would show [*]
+        # with nothing left to run it. Nothing below awaits, so the queue
+        # cannot go away between this check and the last put_nowait().
+        queue = self._execution_queue
+        if queue is None:
+            raise RuntimeError("YNotebookRoom execution worker is not running")
+
         # All checks passed — mark running and enqueue atomically.
         for cell_id, ycell in items:
             if clear_outputs:
                 del ycell["outputs"][:]
             ycell["execution_state"] = "running"
-            await self._execution_queue.put(_ExecutionItem(
+            queue.put_nowait(_ExecutionItem(
                 cell_id=cell_id,
                 ycell=ycell,
                 file_id=file_id,
